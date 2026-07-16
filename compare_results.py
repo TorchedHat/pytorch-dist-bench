@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+Compare two pytorch-dist-bench result directories and flag regressions.
+
+Reads JSON files from baseline and test directories, matches them by
+filename, extracts p50_us timing metrics, and reports % change.
+Exits non-zero if any regression exceeds the threshold — suitable for CI.
+
+Inspired by PyTorch's benchmarks/distributed/ddp/diff.py but adapted
+for the pytorch-dist-bench JSON format.
+
+Usage:
+  python compare_results.py results/baseline/ results/test/
+  python compare_results.py results/baseline/ results/test/ --threshold 10
+"""
+
+import argparse
+import json
+import os
+import sys
+
+
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def extract_label(entry):
+    """Build a human-readable label for a result entry."""
+    parts = []
+    for key in ("collective", "op", "routing", "model", "param_name"):
+        if key in entry:
+            parts.append(str(entry[key]))
+    for key in ("nelems", "seq_len", "num_tokens", "num_layers", "batch_size"):
+        if key in entry:
+            parts.append(f"{key}={entry[key]}")
+    return "  ".join(parts) if parts else "unknown"
+
+
+def find_p50_metrics(entry, prefix=""):
+    """Recursively find all p50_us values in a result entry.
+
+    Yields (metric_path, value) tuples. Walks the full tree so it
+    handles both shallow nesting (stats.p50_us) and deep nesting
+    (dist.gpu_event.p50_us).
+    """
+    if not isinstance(entry, dict):
+        return
+    if "p50_us" in entry:
+        yield (prefix.rstrip("."), entry["p50_us"])
+    for k, v in entry.items():
+        if isinstance(v, dict):
+            yield from find_p50_metrics(v, f"{prefix}{k}.")
+
+
+def compare_file(baseline_path, test_path, threshold):
+    """Compare two JSON result files. Returns (comparisons, regressions, improvements)."""
+    baseline = load_json(baseline_path)
+    test = load_json(test_path)
+
+    b_results = baseline.get("results", [])
+    t_results = test.get("results", [])
+
+    comparisons = []
+    regressions = 0
+    improvements = 0
+
+    for b_entry, t_entry in zip(b_results, t_results):
+        label = extract_label(b_entry)
+        b_metrics = dict(find_p50_metrics(b_entry))
+        t_metrics = dict(find_p50_metrics(t_entry))
+
+        for metric_name in b_metrics:
+            if metric_name not in t_metrics:
+                continue
+            b_val = b_metrics[metric_name]
+            t_val = t_metrics[metric_name]
+            if b_val <= 0:
+                continue
+
+            pct = (t_val - b_val) / b_val * 100
+            flag = ""
+            if pct > threshold:
+                flag = "REGRESSION"
+                regressions += 1
+            elif pct < -threshold:
+                flag = "IMPROVED"
+                improvements += 1
+
+            comparisons.append((label, metric_name, b_val, t_val, pct, flag))
+
+    return comparisons, regressions, improvements
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compare pytorch-dist-bench results and flag regressions")
+    parser.add_argument("baseline", help="Baseline results directory")
+    parser.add_argument("test", help="Test results directory")
+    parser.add_argument("--threshold", type=float, default=5.0,
+                        help="Regression threshold %% (default: 5.0)")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.baseline):
+        print(f"Error: {args.baseline} is not a directory")
+        sys.exit(2)
+    if not os.path.isdir(args.test):
+        print(f"Error: {args.test} is not a directory")
+        sys.exit(2)
+
+    baseline_files = {f for f in os.listdir(args.baseline) if f.endswith(".json")}
+    test_files = {f for f in os.listdir(args.test) if f.endswith(".json")}
+
+    matched = sorted(baseline_files & test_files)
+    only_baseline = sorted(baseline_files - test_files)
+    only_test = sorted(test_files - baseline_files)
+
+    if not matched:
+        print("No matching JSON files found between directories.")
+        sys.exit(2)
+
+    total_regressions = 0
+    total_improvements = 0
+    total_comparisons = 0
+
+    print(f"\n{'=' * 90}")
+    print(f"Comparing: {args.baseline} (baseline) vs {args.test} (test)")
+    print(f"Threshold: +/-{args.threshold}%")
+    print(f"{'=' * 90}")
+
+    for filename in matched:
+        b_path = os.path.join(args.baseline, filename)
+        t_path = os.path.join(args.test, filename)
+
+        try:
+            comparisons, regs, imps = compare_file(b_path, t_path,
+                                                    args.threshold)
+        except Exception as e:
+            print(f"\n=== {filename} === ERROR: {e}")
+            continue
+
+        if not comparisons:
+            continue
+
+        print(f"\n=== {filename} ===")
+
+        for label, metric, b_val, t_val, pct, flag in comparisons:
+            sign = "+" if pct >= 0 else ""
+            flag_str = f"  {flag}" if flag else ""
+            print(
+                f"  {label:<50s} {metric:<20s}"
+                f" {b_val:>8.1f} -> {t_val:>8.1f}"
+                f"  ({sign}{pct:.1f}%){flag_str}"
+            )
+
+        total_regressions += regs
+        total_improvements += imps
+        total_comparisons += len(comparisons)
+
+    unchanged = total_comparisons - total_regressions - total_improvements
+
+    print(f"\n{'=' * 90}")
+    print(f"Summary: {total_comparisons} metrics compared")
+    if total_regressions:
+        print(f"  {total_regressions} REGRESSIONS (>{args.threshold}% slower)")
+    if total_improvements:
+        print(f"  {total_improvements} improvements (<-{args.threshold}% faster)")
+    print(f"  {unchanged} unchanged (within +/-{args.threshold}%)")
+
+    if only_baseline:
+        print(f"\n  Missing from test: {', '.join(only_baseline)}")
+    if only_test:
+        print(f"  Missing from baseline: {', '.join(only_test)}")
+    print(f"{'=' * 90}\n")
+
+    sys.exit(1 if total_regressions > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()
