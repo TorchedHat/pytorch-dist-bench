@@ -6,21 +6,29 @@
 # commit to measurable distributed performance deltas.
 #
 # Usage:
-#   ./ab_test_pytorch_pr.sh <pr_number_or_commit> [nproc]
+#   ./ab_test_pytorch_pr.sh <pr_number_or_commit> [nproc] [pytorch_dir]
 #
 # Examples:
-#   ./ab_test_pytorch_pr.sh 187642 8    # Test PR #187642 on 8 GPUs
-#   ./ab_test_pytorch_pr.sh abc1234 4   # Test commit abc1234 on 4 GPUs
+#   ./ab_test_pytorch_pr.sh 187642 8                       # Test PR #187642 on 8 GPUs
+#   ./ab_test_pytorch_pr.sh abc1234 4 /opt/pytorch         # Custom PyTorch source path
+#   PYTORCH_DIR=/opt/pytorch ./ab_test_pytorch_pr.sh 187642 8  # Via env var
 #
 # Prerequisites:
-#   - PyTorch source at /workspaces/cuda-dev-env/pytorch
+#   - PyTorch source checkout (set PYTORCH_DIR or pass as 3rd arg)
 #   - CUDA toolkit available
 
 set -euo pipefail
 
-PR_OR_COMMIT="${1:?Usage: $0 <pr_number_or_commit> [nproc]}"
+PR_OR_COMMIT="${1:?Usage: $0 <pr_number_or_commit> [nproc] [pytorch_dir]}"
 NPROC="${2:-2}"
-PYTORCH_DIR="/workspaces/cuda-dev-env/pytorch"
+PYTORCH_DIR="${3:-${PYTORCH_DIR:-$(python -c 'import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))' 2>/dev/null || echo "")}}"
+
+if [ -z "$PYTORCH_DIR" ] || [ ! -d "$PYTORCH_DIR/.git" ]; then
+    echo "Error: PyTorch source directory not found."
+    echo "Set PYTORCH_DIR, pass as 3rd argument, or install PyTorch from source."
+    echo "Usage: $0 <pr_number_or_commit> [nproc] [pytorch_dir]"
+    exit 1
+fi
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="${BENCH_DIR}/results"
 

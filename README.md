@@ -181,11 +181,12 @@ Exit code is non-zero when any regression exceeds the threshold (default: 5%).
 `ab_test_pytorch_pr.sh` automates the full workflow: build baseline → run benchmarks → apply PR → rebuild → run benchmarks → compare.
 
 ```bash
-./ab_test_pytorch_pr.sh 187642 8    # Test PR #187642 on 8 GPUs
-./ab_test_pytorch_pr.sh abc1234 4   # Test a specific commit on 4 GPUs
+./ab_test_pytorch_pr.sh 187642 8                       # Test PR #187642 on 8 GPUs
+./ab_test_pytorch_pr.sh abc1234 4 /opt/pytorch         # Custom source path
+PYTORCH_DIR=/opt/pytorch ./ab_test_pytorch_pr.sh 187642 8  # Via env var
 ```
 
-Requires a PyTorch source checkout (defaults to `/workspaces/cuda-dev-env/pytorch`).
+Requires a PyTorch source checkout. Set `PYTORCH_DIR`, pass as the 3rd argument, or have PyTorch installed from source (auto-detected).
 
 ## Measurement methodology
 
