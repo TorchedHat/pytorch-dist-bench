@@ -68,6 +68,20 @@ torchrun --nnodes=3 --nproc_per_node=2 \
   bench_multinode.py --json results/multinode_3n2g.json
 ```
 
+Run only one section:
+
+```bash
+# Collectives only (skip 2D training)
+./run_multinode.sh 3 2 <master-ip> 29500 -- --section collectives
+
+# Training only (skip raw collectives)
+./run_multinode.sh 3 2 <master-ip> 29500 -- --section training
+
+# Custom model dimensions and sweep
+./run_multinode.sh 3 2 <master-ip> 29500 -- --section training \
+  --hidden 4096 --intermediate 11008 --num-layers 2 4 8 --batch-sizes 1 2
+```
+
 ### Launch on Kubernetes (PyTorchJob)
 
 Requires the [Kubeflow Training Operator](https://github.com/kubeflow/training-operator). Edit `k8s/pytorchjob.yaml` to set your container image and NCCL/RDMA configuration, then:
@@ -78,6 +92,14 @@ kubectl logs -f pytorch-dist-bench-multinode-master-0
 ```
 
 For IB/RoCE bandwidth (not TCP socket fallback), pods need RDMA device access. See comments in the YAML.
+
+### NCCL timeout
+
+Set a heartbeat timeout so OOM or network failures surface as errors instead of silent hangs:
+
+```bash
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=300  # default 1800 (30 min)
+```
 
 ### What it measures
 
@@ -90,7 +112,7 @@ For IB/RoCE bandwidth (not TCP socket fallback), pods need RDMA device access. S
 | `inter_agg` | {0,2,4} + {1,3,5} simultaneously | Aggregate IB/RoCE bandwidth under contention |
 | `world` | {0,1,2,3,4,5} | Hierarchical (NVLink + IB/RoCE combined) |
 
-**2D parallelism training** — TP=2 intra-node (ColwiseParallel/RowwiseParallel) + FSDP2 DP=3 inter-node, with a training step sweep over layer counts and batch sizes.
+**2D parallelism training** — TP=2 intra-node (ColwiseParallel/RowwiseParallel) + FSDP2 DP=3 inter-node, with a training step sweep over layer counts and batch sizes. Default dimensions match Llama-70B (hidden=8192, intermediate=28672); override with `--hidden` and `--intermediate`.
 
 ## JSON output
 
@@ -170,8 +192,8 @@ Requires a PyTorch source checkout (defaults to `/workspaces/cuda-dev-env/pytorc
 All benchmarks share infrastructure through `bench_utils.py`:
 
 - **`bench(fn, warmup=50, iters=200)`** — CUDA-synchronous timing with `torch.cuda.synchronize()` before each clock read. Reports p50, p5, p95, IQR. Flags runs where IQR/median exceeds 10%.
-- **`reset_nccl_tuning(fn, warmup=20)`** — Barrier + warmup between configurations. NCCL's runtime tuner explores algorithms when tensor sizes change; without this reset, the first iterations at a new size use a suboptimal algorithm and inject multi-millisecond spikes.
-- **`collect_metadata(name, **kwargs)`** — Captures PyTorch version, commit SHA, CUDA/NCCL versions, GPU model, and parallelism configuration.
+- **`reset_nccl_tuning(fn, warmup=20, group=None)`** — Barrier + warmup between configurations. NCCL's runtime tuner explores algorithms when tensor sizes change; without this reset, the first iterations at a new size use a suboptimal algorithm and inject multi-millisecond spikes. Pass `group` for sub-group benchmarks (e.g. intra-node or inter-node topologies).
+- **`collect_metadata(name, **kwargs)`** — Captures PyTorch version, commit SHA, CUDA/NCCL versions, GPU model, hostname, world size, node count, NCCL environment variables, and parallelism configuration.
 - **Sequential execution** — `run_all.sh` runs benchmarks one at a time to prevent GPU contention from corrupting measurements.
 
 ## Project structure

@@ -206,13 +206,9 @@ def run_collectives_section(args, rank, world_size, local_rank,
 
         if skip_this_rank:
             dist.barrier()
-            dist.barrier()
             continue
 
         for coll_name in collectives:
-            if rank == 0 or (rank < local_world_size and mode != "local_rank==0"):
-                pass  # participating rank
-
             if rank == 0:
                 print(f"\n--- {topo_name}: {coll_name} (group_size={group_size}) ---")
                 hdr = (f"{'nelems':>12} {'nbytes':>10}"
@@ -329,6 +325,8 @@ def run_training_section(args, rank, world_size, local_world_size,
 
     for num_layers in args.num_layers:
         for batch_size in args.batch_sizes:
+            torch.cuda.empty_cache()
+            setup_ok = False
             try:
                 torch.cuda.reset_peak_memory_stats(device)
                 mem_pre = torch.cuda.memory_allocated(device)
@@ -341,47 +339,8 @@ def run_training_section(args, rank, world_size, local_world_size,
                 inp = torch.randn(
                     batch_size, args.hidden, dtype=dtype, device=device,
                 )
-
                 total_params = sum(p.numel() for p in model.parameters())
-
-                def step():
-                    optimizer.zero_grad()
-                    loss = model(inp).sum()
-                    loss.backward()
-                    optimizer.step()
-
-                reset_nccl_tuning(step)
-                s = bench(step, warmup=20, iters=args.iters)
-
-                peak_mb = (
-                    torch.cuda.max_memory_allocated(device) - mem_pre
-                ) / 1024**2
-
-                if rank == 0:
-                    print(
-                        f"{num_layers:>6} {batch_size:>5}"
-                        f" {total_params:>10,}"
-                        f" | {s['p50_us']:>8.0f}us"
-                        f" {s['p50_us'] / 1000:>8.1f}ms"
-                        f" | {peak_mb:>8.0f} MB"
-                    )
-
-                json_results.append({
-                    "section": "2d_training",
-                    "num_layers": num_layers,
-                    "batch_size": batch_size,
-                    "hidden": args.hidden,
-                    "intermediate": args.intermediate,
-                    "tp": local_world_size,
-                    "dp": num_nodes,
-                    "total_params": total_params,
-                    "step": s,
-                    "peak_mem_mb": round(peak_mb, 1),
-                })
-
-                del model, optimizer, inp
-                torch.cuda.empty_cache()
-
+                setup_ok = True
             except torch.cuda.OutOfMemoryError:
                 if rank == 0:
                     print(f"{num_layers:>6} {batch_size:>5}  OOM")
@@ -390,6 +349,50 @@ def run_training_section(args, rank, world_size, local_world_size,
                 if rank == 0:
                     print(f"{num_layers:>6} {batch_size:>5}  FAILED: {e}")
                 torch.cuda.empty_cache()
+
+            ok = torch.tensor([1.0 if setup_ok else 0.0], device=device)
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+            if ok.item() < 1.0:
+                torch.cuda.empty_cache()
+                continue
+
+            def step():
+                optimizer.zero_grad()
+                loss = model(inp).sum()
+                loss.backward()
+                optimizer.step()
+
+            reset_nccl_tuning(step)
+            s = bench(step, warmup=20, iters=args.iters)
+
+            peak_mb = (
+                torch.cuda.max_memory_allocated(device) - mem_pre
+            ) / 1024**2
+
+            if rank == 0:
+                print(
+                    f"{num_layers:>6} {batch_size:>5}"
+                    f" {total_params:>10,}"
+                    f" | {s['p50_us']:>8.0f}us"
+                    f" {s['p50_us'] / 1000:>8.1f}ms"
+                    f" | {peak_mb:>8.0f} MB"
+                )
+
+            json_results.append({
+                "section": "2d_training",
+                "num_layers": num_layers,
+                "batch_size": batch_size,
+                "hidden": args.hidden,
+                "intermediate": args.intermediate,
+                "tp": local_world_size,
+                "dp": num_nodes,
+                "total_params": total_params,
+                "step": s,
+                "peak_mem_mb": round(peak_mb, 1),
+            })
+
+            del model, optimizer, inp
+            torch.cuda.empty_cache()
 
     return json_results
 
@@ -440,7 +443,7 @@ def main():
 
     num_nodes = world_size // local_world_size
 
-    intra_group, inter_group, _, node_id = setup_groups(
+    intra_group, inter_group, _, _ = setup_groups(
         world_size, rank, local_world_size, local_rank,
     )
 
