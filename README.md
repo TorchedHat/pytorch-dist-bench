@@ -2,12 +2,12 @@
 
 Microbenchmark suite for PyTorch distributed operations. Tracks performance across PyTorch releases on GPU clusters, with a focus on the collective operations that dominate tensor-parallel inference and FSDP2 training, including `torch.compile` interactions.
 
-Designed for single-node multi-GPU systems (tested on 8×H200 NVSwitch). All benchmarks produce structured JSON for automated regression detection.
+Designed for single-node multi-GPU systems (tested on 8×H200 NVSwitch), with opt-in multi-node benchmarking for inter-node (IB/RoCE) performance. All benchmarks produce structured JSON for automated regression detection.
 
 ## Quick start
 
 ```bash
-# Run all 9 benchmarks on 8 GPUs, write JSON to ./results/
+# Run all 10 single-node benchmarks on 8 GPUs, write JSON to ./results/
 ./run_all.sh 8
 
 # Run a single benchmark
@@ -40,10 +40,57 @@ Some benchmarks require NVSwitch and symmetric memory support (see table below).
 | `bench_moe_alltoall` | MoE expert-parallel all-to-all dispatch with balanced and skewed (Zipf) routing. Mixtral-8x7B and DeepSeek-V2 shapes. | No |
 | `bench_allreduce_dispatch` | CPU dispatch overhead: pynccl vs ProcessGroupNCCL, with CUDA event timing and CUDA graph variants. | No |
 | `bench_compile_distributed` | `torch.compile` (Inductor) vs eager on FSDP2 training steps and TP-style inference. Tracks whether compile helps, hurts, or breaks distributed workloads across releases. | No |
+| `bench_multinode` | Multi-node collectives decomposed by topology (intra-node NVLink, inter-node IB/RoCE raw + aggregate, WORLD) plus 2D parallelism training (TP intra-node + FSDP2 DP inter-node). **Opt-in** — not run by `run_all.sh`. | No |
 
 ### Portable subset
 
-5 benchmarks run on any multi-GPU system without NVSwitch or symmetric memory: `bench_collectives`, `bench_fsdp2_training`, `bench_moe_alltoall`, `bench_allreduce_dispatch`, `bench_compile_distributed`.
+5 single-node benchmarks run on any multi-GPU system without NVSwitch or symmetric memory: `bench_collectives`, `bench_fsdp2_training`, `bench_moe_alltoall`, `bench_allreduce_dispatch`, `bench_compile_distributed`.
+
+`bench_multinode` also runs without NVSwitch but requires a multi-node setup (see below).
+
+## Multi-node benchmarks
+
+`bench_multinode` is opt-in and requires a multi-node cluster. It is **not** included in `run_all.sh`. Run single-node benchmarks first (`run_all.sh`) for NVLink baselines, then add multi-node measurements.
+
+### Launch with torchrun (bare-metal / SLURM)
+
+Run on each node (or fan out via `pdsh` / `srun`):
+
+```bash
+./run_multinode.sh 3 2 <master-ip> 29500
+```
+
+Or directly:
+
+```bash
+torchrun --nnodes=3 --nproc_per_node=2 \
+  --rdzv_backend=c10d --rdzv_endpoint=<master-ip>:29500 \
+  bench_multinode.py --json results/multinode_3n2g.json
+```
+
+### Launch on Kubernetes (PyTorchJob)
+
+Requires the [Kubeflow Training Operator](https://github.com/kubeflow/training-operator). Edit `k8s/pytorchjob.yaml` to set your container image and NCCL/RDMA configuration, then:
+
+```bash
+kubectl apply -f k8s/pytorchjob.yaml
+kubectl logs -f pytorch-dist-bench-multinode-master-0
+```
+
+For IB/RoCE bandwidth (not TCP socket fallback), pods need RDMA device access. See comments in the YAML.
+
+### What it measures
+
+**Collectives by topology** — AllReduce, AllGather, ReduceScatter at the same 11 message sizes as `bench_collectives`, but on four process groups:
+
+| Group | Ranks (3n2g) | Measures |
+|---|---|---|
+| `intra_node` | {0,1}, {2,3}, {4,5} | NVLink bandwidth within each node |
+| `inter_node` | {0,2,4} (local_rank=0 only) | Raw single-flow IB/RoCE link bandwidth |
+| `inter_agg` | {0,2,4} + {1,3,5} simultaneously | Aggregate IB/RoCE bandwidth under contention |
+| `world` | {0,1,2,3,4,5} | Hierarchical (NVLink + IB/RoCE combined) |
+
+**2D parallelism training** — TP=2 intra-node (ColwiseParallel/RowwiseParallel) + FSDP2 DP=3 inter-node, with a training step sweep over layer counts and batch sizes.
 
 ## JSON output
 
@@ -141,9 +188,12 @@ bench_fsdp2_training.py         # FSDP2 training step (fully_shard)
 bench_moe_alltoall.py           # MoE expert-parallel all-to-all
 bench_allreduce_dispatch.py     # Dispatch overhead comparison
 bench_compile_distributed.py    # torch.compile vs eager (FSDP2 + TP)
-run_all.sh                      # Sequential runner for all benchmarks
+bench_multinode.py              # Multi-node: topology-decomposed collectives + 2D training
+run_all.sh                      # Sequential runner for single-node benchmarks
+run_multinode.sh                # Multi-node launcher (torchrun with rendezvous)
 ab_test_pytorch_pr.sh           # A/B test harness for PyTorch PRs
 compare_results.py              # JSON regression detector
+k8s/pytorchjob.yaml             # Kubernetes PyTorchJob manifest (3 nodes × 2 GPUs)
 ```
 
 ## License

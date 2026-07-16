@@ -28,7 +28,8 @@ def load_json(path):
 def extract_label(entry):
     """Build a human-readable label for a result entry."""
     parts = []
-    for key in ("collective", "op", "routing", "model", "param_name"):
+    for key in ("section", "topology", "collective", "op", "routing",
+                "model", "param_name"):
         if key in entry:
             parts.append(str(entry[key]))
     for key in ("nelems", "seq_len", "num_tokens", "num_layers", "batch_size"):

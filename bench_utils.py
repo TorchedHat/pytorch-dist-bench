@@ -6,6 +6,8 @@ measurement methodology.
 """
 
 import json
+import os
+import socket
 import time
 from datetime import datetime, timezone
 
@@ -88,7 +90,7 @@ def stats(times):
     return result
 
 
-def reset_nccl_tuning(fn, warmup=20):
+def reset_nccl_tuning(fn, warmup=20, group=None):
     """Barrier + warmup between configs to let NCCL re-stabilize.
 
     NCCL's runtime tuner explores algorithms/protocols when tensor size
@@ -98,7 +100,7 @@ def reset_nccl_tuning(fn, warmup=20):
     Call this once before the bench() call when switching tensor sizes.
     bench() does its own warmup for steady-state; this handles the transition.
     """
-    dist.barrier()
+    dist.barrier(group=group)
     torch.cuda.synchronize()
     for _ in range(warmup):
         fn()
@@ -111,6 +113,7 @@ def collect_metadata(benchmark_name, **kwargs):
     Pass parallelism degree as kwargs: tp=8, ep=8, dp=8, etc.
     """
     nccl_ver = torch.cuda.nccl.version()
+    local_gpu_count = torch.cuda.device_count()
     meta = {
         "benchmark": benchmark_name,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -119,8 +122,17 @@ def collect_metadata(benchmark_name, **kwargs):
         "cuda_version": torch.version.cuda or "unknown",
         "nccl_version": f"{nccl_ver[0]}.{nccl_ver[1]}.{nccl_ver[2]}",
         "gpu": torch.cuda.get_device_name(),
-        "gpu_count": torch.cuda.device_count(),
+        "gpu_count": local_gpu_count,
+        "hostname": socket.gethostname(),
     }
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        local_ws = int(os.environ.get("LOCAL_WORLD_SIZE", local_gpu_count))
+        meta["world_size"] = world_size
+        meta["num_nodes"] = world_size // max(local_ws, 1)
+    nccl_env = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+    if nccl_env:
+        meta["nccl_env"] = nccl_env
     meta.update(kwargs)
     return meta
 

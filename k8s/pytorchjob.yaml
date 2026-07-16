@@ -1,0 +1,156 @@
+# PyTorchJob manifest for multi-node benchmarking (Kubeflow Training Operator).
+#
+# Prerequisites:
+#   - Kubeflow Training Operator installed (kubeflow.org/v1 PyTorchJob CRD)
+#   - NVIDIA GPU Operator / device plugin configured
+#   - Container image with PyTorch + CUDA + NCCL + this benchmark suite
+#
+# RDMA / InfiniBand requirements (for real inter-node bandwidth):
+#   Without RDMA, NCCL falls back to TCP sockets — measured bandwidth will
+#   be far below IB/RoCE hardware capability. For IB/RoCE:
+#   - Install the RDMA shared device plugin (k8s-rdma-shared-dev-plugin)
+#   - Use hostNetwork: true, OR configure Multus with an IB-backed
+#     NetworkAttachmentDefinition as a secondary network
+#   - Add CAP_IPC_LOCK to securityContext.capabilities
+#   - Set NCCL_SOCKET_IFNAME to the correct interface (e.g., "eth0" for
+#     pod networking, "ib0" for host IB, "net1" for Multus secondary)
+#
+# Usage:
+#   kubectl apply -f pytorchjob.yaml
+#   kubectl logs -f pytorch-dist-bench-multinode-master-0
+#   kubectl delete pytorchjob pytorch-dist-bench-multinode
+
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: pytorch-dist-bench-multinode
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            app: pytorch-dist-bench
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: pytorch-dist-bench
+                  topologyKey: kubernetes.io/hostname
+          # nodeSelector:
+          #   nvidia.com/gpu.present: "true"
+          containers:
+            - name: benchmark
+              image: your-registry/pytorch-dist-bench:latest
+              workingDir: /workspace/pytorch-dist-bench
+              resources:
+                limits:
+                  nvidia.com/gpu: 2
+                  # Uncomment for RDMA device access:
+                  # rdma/rdma_shared_device_a: 1
+              env:
+                - name: NCCL_DEBUG
+                  value: "WARN"
+                # Uncomment and set for your cluster's network:
+                # - name: NCCL_SOCKET_IFNAME
+                #   value: "eth0"
+                # - name: NCCL_IB_HCA
+                #   value: "mlx5"
+                # - name: NCCL_IB_GID_INDEX
+                #   value: "3"
+                # - name: NCCL_NET_GDR_LEVEL
+                #   value: "5"
+              command: ["/bin/bash", "-c"]
+              args:
+                - >-
+                  torchrun
+                  --nnodes=3
+                  --nproc_per_node=2
+                  --rdzv_backend=c10d
+                  --rdzv_endpoint=$(MASTER_ADDR):$(MASTER_PORT)
+                  bench_multinode.py
+                  --json /results/multinode_3n2g.json
+              # securityContext:
+              #   capabilities:
+              #     add: ["IPC_LOCK"]
+              volumeMounts:
+                - name: results
+                  mountPath: /results
+                - name: dshm
+                  mountPath: /dev/shm
+          volumes:
+            - name: results
+              emptyDir: {}
+              # For persistent results, replace with:
+              # persistentVolumeClaim:
+              #   claimName: bench-results-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+          restartPolicy: Never
+
+    Worker:
+      replicas: 2
+      template:
+        metadata:
+          labels:
+            app: pytorch-dist-bench
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: pytorch-dist-bench
+                  topologyKey: kubernetes.io/hostname
+          # nodeSelector:
+          #   nvidia.com/gpu.present: "true"
+          containers:
+            - name: benchmark
+              image: your-registry/pytorch-dist-bench:latest
+              workingDir: /workspace/pytorch-dist-bench
+              resources:
+                limits:
+                  nvidia.com/gpu: 2
+                  # rdma/rdma_shared_device_a: 1
+              env:
+                - name: NCCL_DEBUG
+                  value: "WARN"
+                # - name: NCCL_SOCKET_IFNAME
+                #   value: "eth0"
+                # - name: NCCL_IB_HCA
+                #   value: "mlx5"
+                # - name: NCCL_IB_GID_INDEX
+                #   value: "3"
+                # - name: NCCL_NET_GDR_LEVEL
+                #   value: "5"
+              command: ["/bin/bash", "-c"]
+              args:
+                - >-
+                  torchrun
+                  --nnodes=3
+                  --nproc_per_node=2
+                  --rdzv_backend=c10d
+                  --rdzv_endpoint=$(MASTER_ADDR):$(MASTER_PORT)
+                  bench_multinode.py
+                  --json /results/multinode_3n2g.json
+              # securityContext:
+              #   capabilities:
+              #     add: ["IPC_LOCK"]
+              volumeMounts:
+                - name: results
+                  mountPath: /results
+                - name: dshm
+                  mountPath: /dev/shm
+          volumes:
+            - name: results
+              emptyDir: {}
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+          restartPolicy: Never
