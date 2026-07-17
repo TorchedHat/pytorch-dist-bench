@@ -33,8 +33,10 @@ BENCHMARKS=(
     bench_fp8_fused_ops
     bench_migration_path
     bench_inference_tp_layer
+    bench_inference_tp_vllm
     bench_training_fsdp_collectives
     bench_fsdp2_training
+    bench_pipeline_parallel
     bench_moe_alltoall
     bench_allreduce_dispatch
     bench_compile_distributed

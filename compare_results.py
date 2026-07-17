@@ -32,7 +32,8 @@ def extract_label(entry):
                 "model", "param_name"):
         if key in entry:
             parts.append(str(entry[key]))
-    for key in ("nelems", "seq_len", "num_tokens", "num_layers", "batch_size"):
+    for key in ("nelems", "seq_len", "num_tokens", "num_layers", "batch_size",
+                "num_microbatches"):
         if key in entry:
             parts.append(f"{key}={entry[key]}")
     return "  ".join(parts) if parts else "unknown"

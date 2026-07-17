@@ -7,7 +7,7 @@ Designed for single-node multi-GPU systems (tested on 8×H200 NVSwitch), with op
 ## Quick start
 
 ```bash
-# Run all 10 single-node benchmarks on 8 GPUs, write JSON to ./results/
+# Run all 12 single-node benchmarks on 8 GPUs, write JSON to ./results/
 ./run_all.sh 8
 
 # Run a single benchmark
@@ -35,8 +35,10 @@ Some benchmarks require NVSwitch and symmetric memory support (see table below).
 | `bench_fp8_fused_ops` | FP8 scaled fused ops (`_fused_all_gather_scaled_matmul`, `_fused_scaled_matmul_reduce_scatter`) vs unfused equivalents. The quantized inference path. | Yes |
 | `bench_migration_path` | pynccl → `torch.distributed` → fused ops progression. Validates that migrating dispatch paths doesn't regress and that fused ops improve latency. | Yes |
 | `bench_inference_tp_layer` | Full TP transformer layer (attention + MLP) with fused vs unfused collectives. Composite benchmark at real Llama-70B dimensions. | Yes |
+| `bench_inference_tp_vllm` | vLLM-style TP inference with standard `dist.all_reduce`: AllReduce at decode (latency-dominated) and prefill (bandwidth-dominated) tensor sizes, plus a full TP layer (4 GEMMs + 2 AllReduces) for Llama-8B/70B/405B. | No |
 | `bench_training_fsdp_collectives` | FSDP2-shaped AllGather/ReduceScatter, low-contention AllGather (copy engine), NVLS AllReduce. Raw collective ops at FSDP parameter shard sizes. | Yes |
 | `bench_fsdp2_training` | Complete FSDP2 training step (`fully_shard()` → zero_grad → forward → backward → optimizer.step) on MLP blocks at Llama-70B dimensions. Tests FSDP2's overlap scheduling end-to-end. | No |
+| `bench_pipeline_parallel` | P2P Send/Recv sweep (NVLink/IB point-to-point bandwidth), GPipe pipeline training step, and FSDP2+PP combined (2D mesh with PP stages × DP replicas). | No |
 | `bench_moe_alltoall` | MoE expert-parallel all-to-all dispatch with balanced and skewed (Zipf) routing. Mixtral-8x7B and DeepSeek-V2 shapes. | No |
 | `bench_allreduce_dispatch` | CPU dispatch overhead: pynccl vs ProcessGroupNCCL, with CUDA event timing and CUDA graph variants. | No |
 | `bench_compile_distributed` | `torch.compile` (Inductor) vs eager on FSDP2 training steps and TP-style inference. Tracks whether compile helps, hurts, or breaks distributed workloads across releases. | No |
@@ -44,7 +46,7 @@ Some benchmarks require NVSwitch and symmetric memory support (see table below).
 
 ### Portable subset
 
-5 single-node benchmarks run on any multi-GPU system without NVSwitch or symmetric memory: `bench_collectives`, `bench_fsdp2_training`, `bench_moe_alltoall`, `bench_allreduce_dispatch`, `bench_compile_distributed`.
+7 single-node benchmarks run on any multi-GPU system without NVSwitch or symmetric memory: `bench_collectives`, `bench_inference_tp_vllm`, `bench_fsdp2_training`, `bench_pipeline_parallel`, `bench_moe_alltoall`, `bench_allreduce_dispatch`, `bench_compile_distributed`.
 
 `bench_multinode` also runs without NVSwitch but requires a multi-node setup (see below).
 
@@ -206,8 +208,10 @@ bench_symm_mem_fused_ops.py     # BF16 fused ops (symmetric memory)
 bench_fp8_fused_ops.py          # FP8 scaled fused ops
 bench_migration_path.py         # pynccl → dist → fused migration
 bench_inference_tp_layer.py     # Full TP layer (attention + MLP)
+bench_inference_tp_vllm.py      # vLLM-style TP inference (standard AllReduce)
 bench_training_fsdp_collectives.py  # FSDP2-shaped raw collectives
 bench_fsdp2_training.py         # FSDP2 training step (fully_shard)
+bench_pipeline_parallel.py      # P2P sweep, GPipe pipeline, FSDP2+PP
 bench_moe_alltoall.py           # MoE expert-parallel all-to-all
 bench_allreduce_dispatch.py     # Dispatch overhead comparison
 bench_compile_distributed.py    # torch.compile vs eager (FSDP2 + TP)
