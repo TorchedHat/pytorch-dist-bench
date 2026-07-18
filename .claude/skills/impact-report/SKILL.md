@@ -44,6 +44,8 @@ Which benchmarks correspond to which product workloads:
 | `bench_symm_mem_fused_ops` | TP inference (fused path) | NVSwitch-accelerated fused GEMM+collective |
 | `bench_training_fsdp_collectives` | FSDP2 training (raw ops) | AllGather/ReduceScatter at FSDP shard sizes |
 | `bench_allreduce_dispatch` | All distributed workloads | Python/C++ dispatch overhead per collective call |
+| `bench_e2e` | All distributed workloads | End-to-end training/inference throughput (samples/sec, tokens/sec) |
+| `bench_verify` | All distributed workloads | Correctness gate — validates operations before performance measurement |
 | `bench_migration_path` | Library migration decisions | pynccl → dist → fused ops progression |
 
 ### 4. Methodology and Caveats

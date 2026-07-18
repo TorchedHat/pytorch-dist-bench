@@ -5,7 +5,7 @@ Microbenchmark suite for PyTorch distributed operations. Tracks performance acro
 ## Quick reference
 
 ```bash
-./run_all.sh 8                                          # all 12 benchmarks, 8 GPUs
+./run_all.sh 8                                          # all 14 benchmarks, 8 GPUs
 torchrun --nproc_per_node=8 bench_collectives.py --json results/out.json  # single benchmark
 python compare_results.py results/baseline/ results/test/                 # compare two runs
 ./ab_test_pytorch_pr.sh 187642 8                                          # A/B test a PR
@@ -15,7 +15,7 @@ python compare_results.py results/baseline/ results/test/                 # comp
 
 - `bench_utils.py` — shared infrastructure: `bench()`, `reset_nccl_tuning()`, `collect_metadata()`, `write_json()`
 - `compare_results.py` — JSON regression detector (matches files by name, compares `p50_us`)
-- `run_all.sh` — sequential runner for all 12 single-node benchmarks
+- `run_all.sh` — sequential runner for all 14 single-node benchmarks
 - `ab_test_pytorch_pr.sh` — A/B test harness for PyTorch PRs
 
 ## Skills

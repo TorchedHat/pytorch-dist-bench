@@ -7,12 +7,111 @@ measurement methodology.
 
 import json
 import os
+import platform
 import socket
+import subprocess
 import time
 from datetime import datetime, timezone
 
 import torch
 import torch.distributed as dist
+
+
+NVLINK_UNIDIR_GBPS = {
+    "H200": 450,
+    "H100": 450,
+    "A100": 300,
+    "A30":  100,
+    "V100": 150,
+}
+
+
+def get_gpu_peak_bandwidth():
+    """Return theoretical peak bandwidth for the current GPU.
+
+    Returns dict with nvlink_unidir_gbps (from lookup) and hbm_gbps
+    (computed from device properties). Returns 0 for unknown GPUs.
+    """
+    props = torch.cuda.get_device_properties(0)
+    gpu_name = props.name
+
+    nvlink = 0
+    for prefix, bw in NVLINK_UNIDIR_GBPS.items():
+        if prefix in gpu_name:
+            nvlink = bw
+            break
+
+    hbm = 0
+    if props.memory_bus_width > 0 and props.memory_clock_rate > 0:
+        hbm = round(
+            props.memory_bus_width * props.memory_clock_rate * 2 / 8 / 1e6, 1)
+
+    return {"nvlink_unidir_gbps": nvlink, "hbm_gbps": hbm}
+
+
+def _get_gpu_driver():
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version",
+             "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, text=True)
+        return out.strip().split("\n")[0]
+    except Exception:
+        return "unknown"
+
+
+def _get_os_distro():
+    try:
+        return platform.freedesktop_os_release().get("PRETTY_NAME", "unknown")
+    except Exception:
+        return "unknown"
+
+
+def fit_alpha_beta(sweep):
+    """Fit alpha-beta model (time = alpha + nbytes/beta) to sweep data.
+
+    Input: list of (nbytes, p50_us) tuples from a message size sweep.
+    Returns: {"alpha_us": float, "beta_gbps": float, "r_squared": float}
+             or None if fewer than 3 points or fit is degenerate.
+
+    alpha_us  = latency (us): startup cost independent of message size.
+    beta_gbps = bandwidth (GB/s): sustained throughput at large messages.
+    r_squared = coefficient of determination (1.0 = perfect linear fit).
+    """
+    n = len(sweep)
+    if n < 3:
+        return None
+
+    xs = [float(x) for x, _ in sweep]
+    ys = [float(y) for _, y in sweep]
+
+    sx = sum(xs)
+    sy = sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-30:
+        return None
+
+    slope = (n * sxy - sx * sy) / denom
+    alpha = (sy - slope * sx) / n
+
+    if slope <= 0:
+        return None
+
+    y_mean = sy / n
+    ss_tot = sum((y - y_mean) ** 2 for y in ys)
+    ss_res = sum((y - (alpha + slope * x)) ** 2 for x, y in zip(xs, ys))
+    r_sq = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+    beta_gbps = 1 / (slope * 1e3)
+
+    return {
+        "alpha_us": round(max(0, alpha), 2),
+        "beta_gbps": round(beta_gbps, 1),
+        "r_squared": round(r_sq, 4),
+    }
 
 
 def bench(fn, *, warmup=50, iters=200):
@@ -114,6 +213,7 @@ def collect_metadata(benchmark_name, **kwargs):
     """
     nccl_ver = torch.cuda.nccl.version()
     local_gpu_count = torch.cuda.device_count()
+    peaks = get_gpu_peak_bandwidth()
     meta = {
         "benchmark": benchmark_name,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -123,6 +223,13 @@ def collect_metadata(benchmark_name, **kwargs):
         "nccl_version": f"{nccl_ver[0]}.{nccl_ver[1]}.{nccl_ver[2]}",
         "gpu": torch.cuda.get_device_name(),
         "gpu_count": local_gpu_count,
+        "gpu_driver": _get_gpu_driver(),
+        "gpu_peak_nvlink_gbps": peaks["nvlink_unidir_gbps"],
+        "gpu_peak_hbm_gbps": peaks["hbm_gbps"],
+        "os": platform.system(),
+        "kernel": platform.release(),
+        "os_distro": _get_os_distro(),
+        "arch": platform.machine(),
         "hostname": socket.gethostname(),
     }
     if dist.is_initialized():

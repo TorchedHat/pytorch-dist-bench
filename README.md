@@ -7,7 +7,7 @@ Designed for single-node multi-GPU systems (tested on 8×H200 NVSwitch), with op
 ## Quick start
 
 ```bash
-# Run all 12 single-node benchmarks on 8 GPUs, write JSON to ./results/
+# Run all 14 single-node benchmarks on 8 GPUs, write JSON to ./results/
 ./run_all.sh 8
 
 # Run a single benchmark
@@ -30,7 +30,8 @@ Some benchmarks require NVSwitch and symmetric memory support (see table below).
 
 | Benchmark | What it measures | NVSwitch required? |
 |---|---|---|
-| `bench_collectives` | AllReduce, AllGather, ReduceScatter at 11 message sizes (1KB–1GB) through `torch.distributed`. The nccl-tests equivalent through the ProcessGroup stack. | No |
+| `bench_verify` | Correctness gate: validates AllReduce, AllGather, ReduceScatter, P2P Send/Recv, FSDP2 training (loss finite + decreasing + params updated), and TP inference (sharded matmul matches reference). Run first — if correctness fails, performance numbers are meaningless. | No |
+| `bench_collectives` | AllReduce, AllGather, ReduceScatter at 11 message sizes (1KB–1GB) through `torch.distributed`. The nccl-tests equivalent through the ProcessGroup stack. Reports efficiency % vs NVLink peak. | No |
 | `bench_symm_mem_fused_ops` | BF16 fused GEMM+ReduceScatter, AllGather+GEMM, NVLS AllReduce via `torch.distributed._symmetric_memory`. The TP inference fast path. | Yes |
 | `bench_fp8_fused_ops` | FP8 scaled fused ops (`_fused_all_gather_scaled_matmul`, `_fused_scaled_matmul_reduce_scatter`) vs unfused equivalents. The quantized inference path. | Yes |
 | `bench_migration_path` | pynccl → `torch.distributed` → fused ops progression. Validates that migrating dispatch paths doesn't regress and that fused ops improve latency. | Yes |
@@ -42,11 +43,12 @@ Some benchmarks require NVSwitch and symmetric memory support (see table below).
 | `bench_moe_alltoall` | MoE expert-parallel all-to-all dispatch with balanced and skewed (Zipf) routing. Mixtral-8x7B and DeepSeek-V2 shapes. | No |
 | `bench_allreduce_dispatch` | CPU dispatch overhead: pynccl vs ProcessGroupNCCL, with CUDA event timing and CUDA graph variants. | No |
 | `bench_compile_distributed` | `torch.compile` (Inductor) vs eager on FSDP2 training steps and TP-style inference. Tracks whether compile helps, hurts, or breaks distributed workloads across releases. | No |
+| `bench_e2e` | End-to-end distributed workloads: FSDP2 training throughput (samples/sec), TP inference throughput (tokens/sec at Llama-70B dims), and FSDP2+PP combined training. Reports throughput metrics rather than individual op latency. | No |
 | `bench_multinode` | Multi-node collectives decomposed by topology (intra-node NVLink, inter-node IB/RoCE raw + aggregate, WORLD) plus 2D parallelism training (TP intra-node + FSDP2 DP inter-node). **Opt-in** — not run by `run_all.sh`. | No |
 
 ### Portable subset
 
-7 single-node benchmarks run on any multi-GPU system without NVSwitch or symmetric memory: `bench_collectives`, `bench_inference_tp_vllm`, `bench_fsdp2_training`, `bench_pipeline_parallel`, `bench_moe_alltoall`, `bench_allreduce_dispatch`, `bench_compile_distributed`.
+9 single-node benchmarks run on any multi-GPU system without NVSwitch or symmetric memory: `bench_verify`, `bench_collectives`, `bench_inference_tp_vllm`, `bench_fsdp2_training`, `bench_pipeline_parallel`, `bench_moe_alltoall`, `bench_allreduce_dispatch`, `bench_compile_distributed`, `bench_e2e`.
 
 `bench_multinode` also runs without NVSwitch but requires a multi-node setup (see below).
 
@@ -130,6 +132,13 @@ Every benchmark writes structured JSON through `bench_utils.write_json()`:
   "nccl_version": "2.25.1",
   "gpu": "NVIDIA H200",
   "gpu_count": 8,
+  "gpu_driver": "550.54.15",
+  "gpu_peak_nvlink_gbps": 450,
+  "gpu_peak_hbm_gbps": 4800.0,
+  "os": "Linux",
+  "kernel": "5.14.0-615.el9.x86_64",
+  "os_distro": "Red Hat Enterprise Linux 9.4",
+  "arch": "x86_64",
   "dp": 8,
   "dtype": "bf16",
   "results": [
@@ -196,13 +205,14 @@ All benchmarks share infrastructure through `bench_utils.py`:
 
 - **`bench(fn, warmup=50, iters=200)`** — CUDA-synchronous timing with `torch.cuda.synchronize()` before each clock read. Reports p50, p5, p95, IQR. Flags runs where IQR/median exceeds 10%.
 - **`reset_nccl_tuning(fn, warmup=20, group=None)`** — Barrier + warmup between configurations. NCCL's runtime tuner explores algorithms when tensor sizes change; without this reset, the first iterations at a new size use a suboptimal algorithm and inject multi-millisecond spikes. Pass `group` for sub-group benchmarks (e.g. intra-node or inter-node topologies).
-- **`collect_metadata(name, **kwargs)`** — Captures PyTorch version, commit SHA, CUDA/NCCL versions, GPU model, hostname, world size, node count, NCCL environment variables, and parallelism configuration.
+- **`collect_metadata(name, **kwargs)`** — Captures PyTorch version, commit SHA, CUDA/NCCL versions, GPU model, GPU driver, peak NVLink/HBM bandwidth, OS distro, kernel version, hostname, world size, node count, NCCL environment variables, and parallelism configuration.
 - **Sequential execution** — `run_all.sh` runs benchmarks one at a time to prevent GPU contention from corrupting measurements.
 
 ## Project structure
 
 ```
 bench_utils.py                  # Shared timing, stats, metadata, JSON output
+bench_verify.py                 # Correctness gate (collectives, P2P, FSDP2, TP)
 bench_collectives.py            # Raw collective sweep (AR/AG/RS × 11 sizes)
 bench_symm_mem_fused_ops.py     # BF16 fused ops (symmetric memory)
 bench_fp8_fused_ops.py          # FP8 scaled fused ops
@@ -215,6 +225,7 @@ bench_pipeline_parallel.py      # P2P sweep, GPipe pipeline, FSDP2+PP
 bench_moe_alltoall.py           # MoE expert-parallel all-to-all
 bench_allreduce_dispatch.py     # Dispatch overhead comparison
 bench_compile_distributed.py    # torch.compile vs eager (FSDP2 + TP)
+bench_e2e.py                    # End-to-end workloads (FSDP2 training, TP inference, FSDP2+PP)
 bench_multinode.py              # Multi-node: topology-decomposed collectives + 2D training
 run_all.sh                      # Sequential runner for single-node benchmarks
 run_multinode.sh                # Multi-node launcher (torchrun with rendezvous)

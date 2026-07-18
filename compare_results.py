@@ -55,6 +55,54 @@ def find_p50_metrics(entry, prefix=""):
             yield from find_p50_metrics(v, f"{prefix}{k}.")
 
 
+def compare_alpha_beta(baseline, test, threshold):
+    """Compare alpha-beta model fits between baseline and test.
+
+    Returns (comparisons, regressions, improvements) for alpha (latency)
+    and beta (bandwidth) per collective.
+    """
+    b_ab = baseline.get("alpha_beta", {})
+    t_ab = test.get("alpha_beta", {})
+
+    comparisons = []
+    regressions = 0
+    improvements = 0
+
+    for coll in b_ab:
+        if coll not in t_ab:
+            continue
+
+        b_alpha = b_ab[coll].get("alpha_us", 0)
+        t_alpha = t_ab[coll].get("alpha_us", 0)
+        if b_alpha > 0:
+            pct = (t_alpha - b_alpha) / b_alpha * 100
+            flag = ""
+            if pct > threshold:
+                flag = "REGRESSION"
+                regressions += 1
+            elif pct < -threshold:
+                flag = "IMPROVED"
+                improvements += 1
+            comparisons.append(
+                (coll, "alpha_us (latency)", b_alpha, t_alpha, pct, flag))
+
+        b_beta = b_ab[coll].get("beta_gbps", 0)
+        t_beta = t_ab[coll].get("beta_gbps", 0)
+        if b_beta > 0:
+            pct = (t_beta - b_beta) / b_beta * 100
+            flag = ""
+            if pct < -threshold:
+                flag = "REGRESSION"
+                regressions += 1
+            elif pct > threshold:
+                flag = "IMPROVED"
+                improvements += 1
+            comparisons.append(
+                (coll, "beta_gbps (bandwidth)", b_beta, t_beta, pct, flag))
+
+    return comparisons, regressions, improvements
+
+
 def compare_file(baseline_path, test_path, threshold):
     """Compare two JSON result files. Returns (comparisons, regressions, improvements)."""
     baseline = load_json(baseline_path)
@@ -90,6 +138,11 @@ def compare_file(baseline_path, test_path, threshold):
                 improvements += 1
 
             comparisons.append((label, metric_name, b_val, t_val, pct, flag))
+
+    ab_comps, ab_regs, ab_imps = compare_alpha_beta(baseline, test, threshold)
+    comparisons.extend(ab_comps)
+    regressions += ab_regs
+    improvements += ab_imps
 
     return comparisons, regressions, improvements
 

@@ -22,7 +22,10 @@ import argparse
 import torch
 import torch.distributed as dist
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import (
+    bench, collect_metadata, fit_alpha_beta, get_gpu_peak_bandwidth,
+    reset_nccl_tuning, write_json,
+)
 
 
 SIZES = [
@@ -145,14 +148,20 @@ def main():
     torch.cuda.reset_peak_memory_stats(device)
     mem_before = torch.cuda.memory_allocated(device)
 
+    peaks = get_gpu_peak_bandwidth()
+    nvlink_peak = peaks["nvlink_unidir_gbps"]
+
     if rank == 0:
-        print(f"\n{'=' * 95}")
+        print(f"\n{'=' * 105}")
         print(f"Raw Collective Operations Benchmark (torch.distributed)")
         print(f"  World size: {world_size}  |  GPU: {torch.cuda.get_device_name(device)}  |  dtype: {args.dtype}")
         print(f"  No fused ops, no symmetric memory — pure NCCL through ProcessGroup")
-        print(f"{'=' * 95}")
+        if nvlink_peak > 0:
+            print(f"  NVLink unidir peak: {nvlink_peak} GB/s")
+        print(f"{'=' * 105}")
 
     all_results = []
+    alpha_beta = {}
 
     for collective_name, bench_fn in [
         ("all_reduce", bench_all_reduce),
@@ -169,44 +178,69 @@ def main():
             print(f"\n--- {collective_name} ---")
             hdr = (f"{'nelems':>12} {'nbytes':>10}"
                    f" | {'p50_us':>10} {'algo_GB/s':>10} {'bus_GB/s':>10}")
+            if nvlink_peak > 0:
+                hdr += f" {'eff_%':>7}"
             print(hdr)
             print("-" * len(hdr))
 
+        sweep_points = []
         for coll_name, nelems, s in results:
             nbytes = nelems * dtype.itemsize
             a_bw = algo_bw(nbytes, s["p50_us"])
             b_bw = bus_bw(a_bw, world_size, coll_name)
 
+            eff_pct = round(b_bw / nvlink_peak * 100, 1) if nvlink_peak > 0 else None
+
             if rank == 0:
-                print(
+                line = (
                     f"{nelems:>12} {format_bytes(nbytes):>10}"
                     f" | {s['p50_us']:>8.1f}us {a_bw:>9.1f} {b_bw:>9.1f}"
                 )
+                if eff_pct is not None:
+                    line += f" {eff_pct:>6.1f}%"
+                print(line)
 
-            all_results.append({
+            sweep_points.append((nbytes, s["p50_us"]))
+
+            entry = {
                 "collective": coll_name,
                 "nelems": nelems,
                 "nbytes": nbytes,
                 "stats": s,
                 "algo_bw_gbps": round(a_bw, 2),
                 "bus_bw_gbps": round(b_bw, 2),
-            })
+            }
+            if eff_pct is not None:
+                entry["efficiency_pct"] = eff_pct
+            all_results.append(entry)
+
+        ab = fit_alpha_beta(sweep_points)
+        if ab is not None:
+            alpha_beta[collective_name] = ab
+            if rank == 0:
+                print(f"  alpha-beta fit: alpha={ab['alpha_us']:.1f} us"
+                      f"  beta={ab['beta_gbps']:.1f} GB/s"
+                      f"  (R²={ab['r_squared']:.4f})")
 
     mem_after = torch.cuda.memory_allocated(device)
 
     if rank == 0:
-        print(f"\n{'=' * 95}")
+        print(f"\n{'=' * 105}")
         print(f"  algo_GB/s = nbytes / time  (raw throughput)")
         print(f"  bus_GB/s  = algo_GB/s * correction  (link utilization)")
         print(f"    AllReduce: 2*(N-1)/N  |  AllGather/ReduceScatter: (N-1)/N")
+        if nvlink_peak > 0:
+            print(f"  eff_%     = bus_GB/s / {nvlink_peak} GB/s  (NVLink unidir peak)")
         print(f"  GPU memory delta: {(mem_after - mem_before) / 1024**2:.1f} MB")
-        print(f"{'=' * 95}\n")
+        print(f"{'=' * 105}\n")
 
         if args.json:
             output = collect_metadata("collectives", dp=world_size,
                                       dtype=args.dtype)
             output["gpu_mem_delta_bytes"] = mem_after - mem_before
             output["gpu_mem_peak_bytes"] = torch.cuda.max_memory_allocated(device)
+            if alpha_beta:
+                output["alpha_beta"] = alpha_beta
             output["results"] = all_results
             write_json(args.json, output)
 

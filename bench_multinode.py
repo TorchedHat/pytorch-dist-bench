@@ -47,7 +47,10 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import (
+    bench, collect_metadata, get_gpu_peak_bandwidth, reset_nccl_tuning,
+    write_json,
+)
 
 
 # ---- Collective helpers (same as bench_collectives.py) ----
@@ -178,6 +181,8 @@ def run_collectives_section(args, rank, world_size, local_rank,
                             local_world_size, device, dtype,
                             intra_group, inter_group, num_nodes):
     """Section 1: Collectives decomposed by topology."""
+    peaks = get_gpu_peak_bandwidth()
+    nvlink_peak = peaks["nvlink_unidir_gbps"]
     json_results = []
 
     topologies = [
@@ -213,6 +218,8 @@ def run_collectives_section(args, rank, world_size, local_rank,
                 print(f"\n--- {topo_name}: {coll_name} (group_size={group_size}) ---")
                 hdr = (f"{'nelems':>12} {'nbytes':>10}"
                        f" | {'p50_us':>10} {'algo_GB/s':>10} {'bus_GB/s':>10}")
+                if nvlink_peak > 0 and topo_name == "intra_node":
+                    hdr += f" {'eff_%':>7}"
                 print(hdr)
                 print("-" * len(hdr))
 
@@ -226,13 +233,19 @@ def run_collectives_section(args, rank, world_size, local_rank,
                 a_bw = algo_bw(nbytes, s["p50_us"])
                 b_bw = bus_bw(a_bw, group_size, coll)
 
+                show_eff = nvlink_peak > 0 and topo_name == "intra_node"
+                eff_pct = round(b_bw / nvlink_peak * 100, 1) if show_eff else None
+
                 if rank == 0:
-                    print(
+                    line = (
                         f"{nelems:>12} {format_bytes(nbytes):>10}"
                         f" | {s['p50_us']:>8.1f}us {a_bw:>9.1f} {b_bw:>9.1f}"
                     )
+                    if eff_pct is not None:
+                        line += f" {eff_pct:>6.1f}%"
+                    print(line)
 
-                json_results.append({
+                entry = {
                     "section": "collectives",
                     "topology": topo_name,
                     "group_size": group_size,
@@ -242,7 +255,10 @@ def run_collectives_section(args, rank, world_size, local_rank,
                     "stats": s,
                     "algo_bw_gbps": round(a_bw, 2),
                     "bus_bw_gbps": round(b_bw, 2),
-                })
+                }
+                if eff_pct is not None:
+                    entry["efficiency_pct"] = eff_pct
+                json_results.append(entry)
 
         if mode == "local_rank==0":
             dist.barrier()

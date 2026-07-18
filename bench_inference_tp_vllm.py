@@ -29,7 +29,10 @@ import math
 import torch
 import torch.distributed as dist
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import (
+    bench, collect_metadata, get_gpu_peak_bandwidth, reset_nccl_tuning,
+    write_json,
+)
 
 MODELS = {
     "Llama-8B":   {"hidden": 4096,  "intermediate": 14336},
@@ -203,6 +206,9 @@ def main():
     torch.cuda.reset_peak_memory_stats(device)
     mem_before = torch.cuda.memory_allocated(device)
 
+    peaks = get_gpu_peak_bandwidth()
+    nvlink_peak = peaks["nvlink_unidir_gbps"]
+
     json_results = []
 
     if rank == 0:
@@ -210,6 +216,8 @@ def main():
         print(f"vLLM-Style TP Inference Benchmark")
         print(f"  TP: {tp}  |  GPU: {torch.cuda.get_device_name(device)}"
               f"  |  dtype: {args.dtype}")
+        if nvlink_peak > 0:
+            print(f"  NVLink unidir peak: {nvlink_peak} GB/s")
         print(f"{'=' * 80}")
 
     # ---- Section 1: AllReduce by inference phase ----
@@ -226,6 +234,8 @@ def main():
                 print(f"\n--- Decode phase (batch × hidden) ---")
                 hdr = (f"{'batch':>8} {'nbytes':>10}"
                        f" | {'p50_us':>10} {'algo_GB/s':>10} {'bus_GB/s':>10}")
+                if nvlink_peak > 0:
+                    hdr += f" {'eff_%':>7}"
                 print(hdr)
                 print("-" * len(hdr))
 
@@ -237,21 +247,31 @@ def main():
 
             printed_prefill_header = False
             for r in results:
+                eff_pct = (round(r["bus_bw_gbps"] / nvlink_peak * 100, 1)
+                           if nvlink_peak > 0 else None)
+                if eff_pct is not None:
+                    r["efficiency_pct"] = eff_pct
+
                 if rank == 0:
                     if r["section"] == "allreduce_prefill" and not printed_prefill_header:
                         print(f"\n--- Prefill phase (seq_len × hidden) ---")
                         hdr = (f"{'seq_len':>8} {'nbytes':>10}"
                                f" | {'p50_us':>10} {'algo_GB/s':>10} {'bus_GB/s':>10}")
+                        if nvlink_peak > 0:
+                            hdr += f" {'eff_%':>7}"
                         print(hdr)
                         print("-" * len(hdr))
                         printed_prefill_header = True
 
                     size_key = r.get("batch_size", r.get("seq_len"))
-                    print(
+                    line = (
                         f"{size_key:>8} {format_bytes(r['nbytes']):>10}"
                         f" | {r['stats']['p50_us']:>8.1f}us"
                         f" {r['algo_bw_gbps']:>9.1f} {r['bus_bw_gbps']:>9.1f}"
                     )
+                    if eff_pct is not None:
+                        line += f" {eff_pct:>6.1f}%"
+                    print(line)
 
                 json_results.append(r)
 

@@ -1,7 +1,7 @@
 """
 Benchmark pipeline parallelism: P2P communication and pipeline training steps.
 
-Three sections:
+Four sections:
 
   1. P2P Send/Recv sweep
      Bidirectional point-to-point between adjacent ranks at 11 message sizes.
@@ -11,17 +11,22 @@ Three sections:
   2. Pipeline training step (PP only)
      GPipe-style pipeline: each GPU is one stage holding a subset of layers.
      All microbatches forward through the pipeline, then backward in reverse.
-     Uses blocking dist.send/recv for activation and gradient transfer.
+     Reports theoretical pipeline bubble fraction.
 
   3. FSDP2 + PP combined
      2D parallelism: PP stages × DP replicas = world_size. Each stage's model
-     is FSDP2-sharded across its DP group. FSDP2 AllGather/ReduceScatter
-     overlap with PP Send/Recv on separate process groups.
+     is FSDP2-sharded across its DP group. Reports bubble fraction.
+
+  4. All-pairs P2P latency matrix
+     Measures P2P between every GPU pair using tournament scheduling.
+     Detects topology asymmetries (degraded NVLink, PCIe bottleneck).
+     Reports NxN matrix at two sizes (latency-dominated and BW-dominated).
 
 Usage:
   torchrun --nproc_per_node=8 bench_pipeline_parallel.py
   torchrun --nproc_per_node=2 bench_pipeline_parallel.py --section p2p
   torchrun --nproc_per_node=4 bench_pipeline_parallel.py --section fsdp2_pp --pp-stages 2
+  torchrun --nproc_per_node=8 bench_pipeline_parallel.py --section all_pairs
 """
 
 import argparse
@@ -32,7 +37,10 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import (
+    bench, collect_metadata, get_gpu_peak_bandwidth, reset_nccl_tuning,
+    write_json,
+)
 
 SIZES = [
     512, 2048, 8192, 32768, 131072, 524288,
@@ -190,6 +198,9 @@ def bench_pipeline(rank, world_size, device, dtype,
     total_params = sum(p.numel() for p in stage_model.parameters())
     peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
 
+    bubble_pct = round(
+        (pp_stages - 1) / (pp_stages - 1 + num_microbatches) * 100, 1)
+
     del stage_model, optimizer, inp
     torch.cuda.empty_cache()
 
@@ -197,6 +208,8 @@ def bench_pipeline(rank, world_size, device, dtype,
         "pp_stages": pp_stages,
         "layers_per_stage": layers_per_stage,
         "total_params_per_stage": total_params,
+        "num_microbatches": num_microbatches,
+        "bubble_pct": bubble_pct,
         "step": s,
         "peak_mem_mb": round(peak_mb, 1),
     }
@@ -256,6 +269,8 @@ def bench_fsdp2_pp(rank, world_size, device, dtype,
 
     total_params = sum(p.numel() for p in stage_model.parameters())
     peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
+    bubble_pct = round(
+        (pp_stages - 1) / (pp_stages - 1 + num_microbatches) * 100, 1)
 
     del stage_model, optimizer, inp
     torch.cuda.empty_cache()
@@ -265,9 +280,95 @@ def bench_fsdp2_pp(rank, world_size, device, dtype,
         "dp_size": dp_size,
         "layers_per_stage": layers_per_stage,
         "total_params_per_stage": total_params,
+        "num_microbatches": num_microbatches,
+        "bubble_pct": bubble_pct,
         "step": s,
         "peak_mem_mb": round(peak_mb, 1),
     }
+
+
+# ---- Section 4: All-pairs P2P latency matrix ----
+
+
+ALL_PAIRS_SIZES = [8192, 33554432]
+
+
+def bench_all_pairs_p2p(rank, world_size, device, dtype, warmup, iters):
+    """Measure P2P between all GPU pairs using tournament scheduling.
+
+    In round k (k=1..N-1), rank i sends to (i+k)%N and receives from
+    (i-k+N)%N. All ranks participate simultaneously. Completes all
+    N*(N-1) directed pairs in N-1 rounds.
+
+    Returns list of result dicts (one per message size) with the full
+    NxN latency/bandwidth matrix.
+    """
+    if world_size < 2:
+        return []
+
+    json_results = []
+
+    for nelems in ALL_PAIRS_SIZES:
+        nbytes = nelems * dtype.itemsize
+
+        my_times = torch.zeros(world_size, device=device)
+
+        for k in range(1, world_size):
+            dst = (rank + k) % world_size
+            src = (rank - k + world_size) % world_size
+
+            send_buf = torch.randn(nelems, dtype=dtype, device=device)
+            recv_buf = torch.empty(nelems, dtype=dtype, device=device)
+
+            def fn():
+                ops = [
+                    dist.P2POp(dist.isend, send_buf, dst),
+                    dist.P2POp(dist.irecv, recv_buf, src),
+                ]
+                reqs = dist.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
+
+            reset_nccl_tuning(fn, warmup=max(5, warmup // 4))
+            s = bench(fn, warmup=max(5, warmup // 4), iters=max(20, iters // 4))
+            my_times[dst] = s["p50_us"]
+
+        all_times = [torch.zeros(world_size, device=device)
+                     for _ in range(world_size)]
+        dist.all_gather(all_times, my_times)
+
+        pairs = []
+        all_p50 = []
+        all_bw = []
+        for src_r in range(world_size):
+            for dst_r in range(world_size):
+                if src_r == dst_r:
+                    continue
+                p50 = all_times[src_r][dst_r].item()
+                bw = p2p_bw(nbytes, p50)
+                pairs.append({
+                    "src": src_r, "dst": dst_r,
+                    "p50_us": round(p50, 1),
+                    "bw_gbps": round(bw, 1),
+                })
+                all_p50.append(p50)
+                all_bw.append(bw)
+
+        entry = {
+            "section": "all_pairs_p2p",
+            "nelems": nelems,
+            "nbytes": nbytes,
+            "pairs": pairs,
+        }
+        if all_p50:
+            mn, mx = min(all_p50), max(all_p50)
+            entry["latency_max_min_ratio"] = round(mx / mn, 2) if mn > 0 else None
+            mn_bw, mx_bw = min(all_bw), max(all_bw)
+            entry["bw_max_min_ratio"] = round(mx_bw / mn_bw, 2) if mn_bw > 0 else None
+
+        json_results.append(entry)
+
+    return json_results
 
 
 # ---- Main ----
@@ -278,7 +379,8 @@ def main():
         description="Pipeline parallelism benchmark: P2P sweep, pipeline "
                     "training step, and FSDP2+PP combined")
     parser.add_argument("--section", default="all",
-                        choices=["all", "p2p", "pipeline", "fsdp2_pp"])
+                        choices=["all", "p2p", "pipeline", "fsdp2_pp",
+                                 "all_pairs"])
     parser.add_argument("--pp-stages", type=int, default=0,
                         help="PP stages (0 = world_size for p2p/pipeline, "
                              "2 for fsdp2_pp)")
@@ -310,6 +412,9 @@ def main():
     torch.cuda.reset_peak_memory_stats(device)
     mem_before = torch.cuda.memory_allocated(device)
 
+    peaks = get_gpu_peak_bandwidth()
+    nvlink_peak = peaks["nvlink_unidir_gbps"]
+
     json_results = []
 
     if rank == 0:
@@ -317,6 +422,8 @@ def main():
         print(f"Pipeline Parallelism Benchmark")
         print(f"  World: {world_size}  |  GPU: {torch.cuda.get_device_name(device)}"
               f"  |  dtype: {args.dtype}")
+        if nvlink_peak > 0:
+            print(f"  NVLink unidir peak: {nvlink_peak} GB/s")
         print(f"{'=' * 80}")
 
     # ---- Section 1: P2P sweep ----
@@ -328,6 +435,8 @@ def main():
             print(f"{'=' * 80}")
             hdr = (f"{'nelems':>12} {'nbytes':>10}"
                    f" | {'p50_us':>10} {'GB/s':>10}")
+            if nvlink_peak > 0:
+                hdr += f" {'eff_%':>7}"
             print(hdr)
             print("-" * len(hdr))
 
@@ -337,20 +446,27 @@ def main():
         for nelems, s in results:
             nbytes = nelems * dtype.itemsize
             bw = p2p_bw(nbytes, s["p50_us"])
+            eff_pct = round(bw / nvlink_peak * 100, 1) if nvlink_peak > 0 else None
 
             if rank == 0:
-                print(
+                line = (
                     f"{nelems:>12} {format_bytes(nbytes):>10}"
                     f" | {s['p50_us']:>8.1f}us {bw:>9.1f}"
                 )
+                if eff_pct is not None:
+                    line += f" {eff_pct:>6.1f}%"
+                print(line)
 
-            json_results.append({
+            entry = {
                 "section": "p2p",
                 "nelems": nelems,
                 "nbytes": nbytes,
                 "stats": s,
                 "bw_gbps": round(bw, 2),
-            })
+            }
+            if eff_pct is not None:
+                entry["efficiency_pct"] = eff_pct
+            json_results.append(entry)
 
     # ---- Section 2: Pipeline training ----
 
@@ -363,7 +479,7 @@ def main():
             print()
             hdr = (f"{'layers':>6} {'batch':>5} {'mbs':>4} {'params/stg':>12}"
                    f" | {'step_us':>10} {'step_ms':>10}"
-                   f" | {'peak_MB':>10}")
+                   f" | {'bubble%':>8} {'peak_MB':>10}")
             print(hdr)
             print("-" * len(hdr))
 
@@ -397,14 +513,14 @@ def main():
                             f" {result['total_params_per_stage']:>12,}"
                             f" | {result['step']['p50_us']:>8.0f}us"
                             f" {result['step']['p50_us'] / 1000:>8.1f}ms"
-                            f" | {result['peak_mem_mb']:>8.0f} MB"
+                            f" | {result['bubble_pct']:>6.1f}%"
+                            f" {result['peak_mem_mb']:>8.0f} MB"
                         )
 
                     json_results.append({
                         "section": "pipeline",
                         "num_layers": num_layers,
                         "batch_size": batch_size,
-                        "num_microbatches": num_mbs,
                         **result,
                     })
 
@@ -428,7 +544,7 @@ def main():
                 print()
                 hdr = (f"{'layers':>6} {'batch':>5} {'mbs':>4} {'params/stg':>12}"
                        f" | {'step_us':>10} {'step_ms':>10}"
-                       f" | {'peak_MB':>10}")
+                       f" | {'bubble%':>8} {'peak_MB':>10}")
                 print(hdr)
                 print("-" * len(hdr))
 
@@ -471,16 +587,67 @@ def main():
                                 f" {result['total_params_per_stage']:>12,}"
                                 f" | {result['step']['p50_us']:>8.0f}us"
                                 f" {result['step']['p50_us'] / 1000:>8.1f}ms"
-                                f" | {result['peak_mem_mb']:>8.0f} MB"
+                                f" | {result['bubble_pct']:>6.1f}%"
+                                f" {result['peak_mem_mb']:>8.0f} MB"
                             )
 
                         json_results.append({
                             "section": "fsdp2_pp",
                             "num_layers": num_layers,
                             "batch_size": batch_size,
-                            "num_microbatches": num_mbs,
                             **result,
                         })
+
+    # ---- Section 4: All-pairs P2P ----
+
+    if args.section in ("all", "all_pairs"):
+        if rank == 0:
+            print(f"\n{'=' * 80}")
+            print(f"  All-Pairs P2P Latency Matrix (tournament scheduling)")
+            print(f"  Bidirectional: send to one partner, recv from another")
+            if nvlink_peak > 0:
+                print(f"  NVLink unidir peak: {nvlink_peak} GB/s")
+            print(f"{'=' * 80}")
+
+        ap_results = bench_all_pairs_p2p(
+            rank, world_size, device, dtype,
+            args.warmup, args.iters)
+
+        for entry in ap_results:
+            nbytes = entry["nbytes"]
+            label = ("latency-dominated" if nbytes < 1 << 20
+                     else "bandwidth-dominated")
+
+            if rank == 0:
+                print(f"\n--- {format_bytes(nbytes)} ({label}) ---")
+                hdr = "     " + "".join(f"{'GPU' + str(d):>9}" for d in range(world_size))
+                print(hdr)
+
+                for src_r in range(world_size):
+                    row = f"GPU{src_r} "
+                    for dst_r in range(world_size):
+                        if src_r == dst_r:
+                            row += f"{'---':>9}"
+                        else:
+                            pair = next(
+                                p for p in entry["pairs"]
+                                if p["src"] == src_r and p["dst"] == dst_r)
+                            if nbytes < 1 << 20:
+                                row += f"{pair['p50_us']:>7.1f}us"
+                            else:
+                                row += f"{pair['bw_gbps']:>6.1f}G/s"
+                    print(row)
+
+                ratio = entry.get("latency_max_min_ratio")
+                bw_ratio = entry.get("bw_max_min_ratio")
+                if ratio is not None:
+                    sym = "symmetric" if ratio < 1.15 else "ASYMMETRIC"
+                    print(f"  Latency max/min ratio: {ratio:.2f} ({sym})")
+                if bw_ratio is not None and nbytes >= 1 << 20:
+                    sym = "symmetric" if bw_ratio < 1.15 else "ASYMMETRIC"
+                    print(f"  BW max/min ratio: {bw_ratio:.2f} ({sym})")
+
+        json_results.extend(ap_results)
 
     # ---- JSON output ----
 

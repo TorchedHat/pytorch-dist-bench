@@ -16,7 +16,7 @@ How to run the benchmark suite, produce valid comparisons, and avoid statistical
 ./run_all.sh 8 --json-dir /path/to/output   # custom output directory
 ```
 
-Runs all 12 benchmarks sequentially (prevents GPU contention). Takes ~12 minutes on 2 GPUs, proportionally similar on 8 GPUs. Each benchmark writes `bench_NAME_tpN.json`.
+Runs all 14 benchmarks sequentially (prevents GPU contention), starting with `bench_verify` (correctness gate). Each benchmark writes `bench_NAME_tpN.json`.
 
 ### Individual benchmarks
 
@@ -110,6 +110,13 @@ Every benchmark writes through `bench_utils.write_json()`:
   "nccl_version": "2.25.1",
   "gpu": "NVIDIA H200",
   "gpu_count": 8,
+  "gpu_driver": "550.54.15",
+  "gpu_peak_nvlink_gbps": 450,
+  "gpu_peak_hbm_gbps": 4800.0,
+  "os": "Linux",
+  "kernel": "5.14.0-615.el9.x86_64",
+  "os_distro": "Red Hat Enterprise Linux 9.4",
+  "arch": "x86_64",
   "hostname": "...",
   "world_size": 8,
   "num_nodes": 1,

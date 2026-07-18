@@ -28,6 +28,7 @@ done
 mkdir -p "$JSON_DIR"
 
 BENCHMARKS=(
+    bench_verify
     bench_collectives
     bench_symm_mem_fused_ops
     bench_fp8_fused_ops
@@ -40,6 +41,7 @@ BENCHMARKS=(
     bench_moe_alltoall
     bench_allreduce_dispatch
     bench_compile_distributed
+    bench_e2e
 )
 
 PASSED=()
