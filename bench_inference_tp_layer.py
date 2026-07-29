@@ -28,9 +28,15 @@ import math
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+except (ImportError, ModuleNotFoundError):
+    raise SystemExit(
+        "bench_inference_tp_layer requires torch.distributed._symmetric_memory "
+        "(not available in this PyTorch build)"
+    )
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
 
 
 MODELS = {
@@ -44,14 +50,6 @@ MODELS = {
 
 SEQ_LENGTHS = [128, 512, 2048, 8192, 32768]
 
-
-
-def verify_close(name, a, b, atol=1e-1, rtol=1e-1):
-    """One-shot correctness check. Aborts if fused and unfused disagree."""
-    if not torch.allclose(a, b, atol=atol, rtol=rtol):
-        max_diff = (a - b).abs().max().item()
-        raise RuntimeError(
-            f"Correctness check failed for {name}: max_diff={max_diff:.4f}")
 
 
 def bench_layer(group_name, rank, tp, seq_len, hidden, intermediate,
@@ -150,7 +148,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     tp = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -180,8 +178,10 @@ def main():
 
     for model_name in args.models:
         cfg = MODELS[model_name]
+        if cfg["hidden"] % tp != 0 or cfg["intermediate"] % tp != 0:
+            continue
         for seq_len in args.seq_lengths:
-            if seq_len < tp:
+            if seq_len < tp or seq_len % tp != 0:
                 continue
             try:
                 s_unfused, s_fused = bench_layer(
@@ -235,6 +235,9 @@ def main():
             output["gpu_mem_peak_bytes"] = torch.cuda.max_memory_allocated(device)
             output["results"] = json_results
             write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 

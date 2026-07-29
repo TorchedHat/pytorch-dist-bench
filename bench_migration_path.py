@@ -23,9 +23,15 @@ import argparse
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+except (ImportError, ModuleNotFoundError):
+    raise SystemExit(
+        "bench_migration_path requires torch.distributed._symmetric_memory "
+        "(not available in this PyTorch build)"
+    )
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
 
 
 CONFIGS = [
@@ -38,14 +44,6 @@ CONFIGS = [
     (32768, 8192, "xxl-prefill"),
 ]
 
-
-
-def verify_close(name, a, b, atol=1e-1, rtol=1e-1):
-    """One-shot correctness check. Aborts if fused and unfused disagree."""
-    if not torch.allclose(a, b, atol=atol, rtol=rtol):
-        max_diff = (a - b).abs().max().item()
-        raise RuntimeError(
-            f"Correctness check failed for {name}: max_diff={max_diff:.4f}")
 
 
 def try_import_pynccl():
@@ -67,7 +65,7 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     args = parser.parse_args()
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     tp = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -115,7 +113,7 @@ def main():
         print("-" * len(cols))
 
     for seq_len, hidden, label in CONFIGS:
-        if seq_len < tp:
+        if seq_len < tp or seq_len % tp != 0 or hidden % tp != 0:
             continue
 
         K = hidden // tp
@@ -193,7 +191,7 @@ def main():
         print("-" * len(cols))
 
     for seq_len, hidden, label in CONFIGS:
-        if seq_len < tp:
+        if seq_len < tp or seq_len % tp != 0 or hidden % tp != 0:
             continue
 
         shard = seq_len // tp
@@ -255,6 +253,9 @@ def main():
             output["pynccl_available"] = pynccl_comm is not None
             output["results"] = json_results
             write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     if pynccl_comm is not None:
         pynccl_comm.destroy()

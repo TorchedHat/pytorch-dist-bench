@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from bench_utils import collect_metadata, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, write_json
 
 
 class MLPBlock(nn.Module):
@@ -163,11 +163,12 @@ def verify_fsdp2_training(rank, world_size, device, dtype):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     inp = torch.randn(4, hidden, dtype=dtype, device=device)
+    target = torch.randn(4, hidden, dtype=dtype, device=device)
 
     losses = []
     for step in range(10):
         optimizer.zero_grad()
-        loss = model(inp).sum()
+        loss = torch.nn.functional.mse_loss(model(inp), target)
         losses.append(loss.item())
         loss.backward()
         optimizer.step()
@@ -212,6 +213,8 @@ def verify_tp_inference(rank, world_size, device, dtype):
     results = []
 
     hidden = 256
+    if hidden % world_size != 0:
+        hidden = world_size * (256 // world_size or 1)
     tokens = 4
 
     torch.manual_seed(0)
@@ -225,22 +228,12 @@ def verify_tp_inference(rank, world_size, device, dtype):
 
     shard_size = hidden // world_size
     W_shard = W_full[:, rank * shard_size : (rank + 1) * shard_size].contiguous()
-    partial = torch.mm(x, W_shard)
-
-    full_out = torch.zeros(tokens, hidden, dtype=dtype, device=device)
-    dist.all_gather_into_tensor(
-        full_out.view(tokens * world_size, shard_size),
-        partial,
-    )
-
     col_partial = torch.mm(x, W_shard)
-    out_sharded = torch.zeros(tokens, shard_size, dtype=dtype, device=device)
-    out_sharded.copy_(col_partial)
 
     gathered = torch.empty(tokens, hidden, dtype=dtype, device=device)
     dist.all_gather_into_tensor(
         gathered.view(tokens * world_size, shard_size),
-        out_sharded,
+        col_partial,
     )
     gathered_reorder = gathered.view(world_size, tokens, shard_size)
     gathered_result = gathered_reorder.permute(1, 0, 2).contiguous().view(tokens, hidden)
@@ -285,7 +278,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")

@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, write_json
 
 
 class MLPBlock(nn.Module):
@@ -88,7 +88,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -190,6 +190,9 @@ def main():
             output["gpu_mem_peak_bytes"] = torch.cuda.max_memory_allocated(device)
             output["results"] = json_results
             write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 

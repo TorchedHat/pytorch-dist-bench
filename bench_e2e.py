@@ -38,7 +38,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import collect_metadata, stats, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, stats, write_json
 
 
 # ---- Models ----
@@ -82,12 +82,13 @@ def bench_fsdp2_training(rank, world_size, device, dtype,
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     inp = torch.randn(batch_size, hidden, dtype=dtype, device=device)
+    target = torch.randn(batch_size, hidden, dtype=dtype, device=device)
 
     total_params = sum(p.numel() for p in model.parameters())
 
     for _ in range(warmup):
         optimizer.zero_grad()
-        loss = model(inp).sum()
+        loss = torch.nn.functional.mse_loss(model(inp), target)
         loss.backward()
         optimizer.step()
     torch.cuda.synchronize()
@@ -99,7 +100,7 @@ def bench_fsdp2_training(rank, world_size, device, dtype,
         torch.cuda.synchronize()
         t0 = time.perf_counter_ns()
         optimizer.zero_grad()
-        loss = model(inp).sum()
+        loss = torch.nn.functional.mse_loss(model(inp), target)
         loss.backward()
         optimizer.step()
         torch.cuda.synchronize()
@@ -205,9 +206,9 @@ def bench_tp_inference(rank, world_size, device, dtype,
 # ---- Section 3: FSDP2+PP training throughput ----
 
 
-def pipeline_step(stage_model, optimizer, inp_or_none, pp_rank, pp_stages,
-                  prev_rank, next_rank, num_microbatches, mb_size,
-                  hidden, device, dtype):
+def pipeline_step(stage_model, optimizer, inp_or_none, target_or_none,
+                  pp_rank, pp_stages, prev_rank, next_rank,
+                  num_microbatches, mb_size, hidden, device, dtype):
     saved = []
     optimizer.zero_grad()
 
@@ -228,7 +229,8 @@ def pipeline_step(stage_model, optimizer, inp_or_none, pp_rank, pp_stages,
     for mb in reversed(range(num_microbatches)):
         x, out = saved[mb]
         if next_rank is None:
-            loss = out.sum() / num_microbatches
+            tgt = target_or_none[mb * mb_size : (mb + 1) * mb_size]
+            loss = torch.nn.functional.mse_loss(out, tgt) / num_microbatches
             loss.backward()
         else:
             grad = torch.empty_like(out)
@@ -285,10 +287,14 @@ def bench_fsdp2_pp_training(rank, world_size, device, dtype,
     if pp_rank == 0:
         inp = torch.randn(batch_size, hidden, dtype=dtype, device=device)
 
+    target = None
+    if next_rank is None:
+        target = torch.randn(batch_size, hidden, dtype=dtype, device=device)
+
     def step():
-        pipeline_step(stage_model, optimizer, inp, pp_rank, pp_stages,
-                      prev_rank, next_rank, num_microbatches, mb_size,
-                      hidden, device, dtype)
+        pipeline_step(stage_model, optimizer, inp, target,
+                      pp_rank, pp_stages, prev_rank, next_rank,
+                      num_microbatches, mb_size, hidden, device, dtype)
 
     for _ in range(warmup):
         step()
@@ -359,7 +365,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -424,6 +430,8 @@ def main():
                   f" hidden={args.hidden}) ---")
 
         for name, batch, seq_len in scenarios:
+            ok = torch.tensor([1.0], device=device)
+            r = None
             try:
                 r = bench_tp_inference(
                     rank, world_size, device, dtype,
@@ -434,19 +442,24 @@ def main():
                     if rank == 0:
                         print(f"  {name}: skipped (dims not divisible by TP={world_size})")
                     continue
+            except torch.cuda.OutOfMemoryError:
+                if rank == 0:
+                    print(f"  {name}: OOM — skipping")
+                ok.zero_()
+                torch.cuda.empty_cache()
+            except Exception as e:
+                if rank == 0:
+                    print(f"  {name}: FAILED: {e}")
+                ok.zero_()
+                torch.cuda.empty_cache()
+
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+            if ok.item() >= 1.0 and r is not None:
                 if rank == 0:
                     print(f"  {name}:")
                     print(f"    Latency p50:  {r['step']['p50_us'] / 1000:.2f} ms")
                     print(f"    Tokens/sec:   {r['tokens_per_sec']:.1f}")
                 json_results.append(r)
-            except torch.cuda.OutOfMemoryError:
-                if rank == 0:
-                    print(f"  {name}: OOM — skipping")
-                torch.cuda.empty_cache()
-            except Exception as e:
-                if rank == 0:
-                    print(f"  {name}: FAILED: {e}")
-                torch.cuda.empty_cache()
 
     # ---- Section 3: FSDP2+PP ----
 
@@ -506,6 +519,9 @@ def main():
             )
             output["results"] = json_results
             write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 
