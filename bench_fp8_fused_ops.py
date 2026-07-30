@@ -22,9 +22,15 @@ import argparse
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+except (ImportError, ModuleNotFoundError):
+    raise SystemExit(
+        "bench_fp8_fused_ops requires torch.distributed._symmetric_memory "
+        "(not available in this PyTorch build)"
+    )
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
 
 
 MODELS = {
@@ -35,22 +41,6 @@ MODELS = {
 
 SEQ_LENGTHS = [128, 512, 2048, 8192]
 
-
-
-def verify_close(name, a, b, K):
-    """Correctness check for FP8 paths.
-
-    FP8 e4m3 has ~3 mantissa bits. Different kernels (cuBLAS vs fused) use
-    different tiling and accumulation order, so max_diff scales as O(sqrt(K))
-    where K is the reduction dimension. We set atol = sqrt(K) * 0.15 to catch
-    gross errors (silent no-ops, doubled values) without false-positives.
-    """
-    atol = max(1.0, K ** 0.5 * 0.15)
-    if not torch.allclose(a.float(), b.float(), atol=atol, rtol=0.1):
-        max_diff = (a.float() - b.float()).abs().max().item()
-        raise RuntimeError(
-            f"Correctness check failed for {name}: max_diff={max_diff:.4f}, "
-            f"atol={atol:.2f} (K={K})")
 
 
 def bench_reduce_scatter(group_name, rank, world_size, seq_len, K, N,
@@ -88,7 +78,7 @@ def bench_reduce_scatter(group_name, rank, world_size, seq_len, K, N,
     ref = out_unfused.clone()
     out_fused = fused()
     torch.cuda.synchronize()
-    verify_close("fp8_reduce_scatter", ref, out_fused, K)
+    verify_close("fp8_reduce_scatter", ref, out_fused)
 
     return bench(unfused, warmup=warmup, iters=iters), bench(fused, warmup=warmup, iters=iters)
 
@@ -130,7 +120,7 @@ def bench_all_gather(group_name, rank, world_size, seq_len, K, N,
     ref = ref.clone()
     _, (out_fused,) = fused()
     torch.cuda.synchronize()
-    verify_close("fp8_all_gather", ref, out_fused, K)
+    verify_close("fp8_all_gather", ref, out_fused)
 
     return bench(unfused, warmup=warmup, iters=iters), bench(fused, warmup=warmup, iters=iters)
 
@@ -148,7 +138,7 @@ def main():
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -179,8 +169,10 @@ def main():
 
     for model_name in args.models:
         cfg = MODELS[model_name]
+        if cfg["hidden"] % world_size != 0:
+            continue
         for seq_len in args.seq_lengths:
-            if seq_len < world_size:
+            if seq_len < world_size or seq_len % world_size != 0:
                 continue
             try:
                 K = cfg["hidden"] // world_size
@@ -226,8 +218,10 @@ def main():
 
     for model_name in args.models:
         cfg = MODELS[model_name]
+        if cfg["hidden"] % world_size != 0:
+            continue
         for seq_len in args.seq_lengths:
-            if seq_len < world_size:
+            if seq_len < world_size or seq_len % world_size != 0:
                 continue
             try:
                 K = cfg["hidden"]
@@ -274,8 +268,10 @@ def main():
 
     for model_name in args.models:
         cfg = MODELS[model_name]
+        if cfg["hidden"] % world_size != 0:
+            continue
         for seq_len in args.seq_lengths:
-            if seq_len < world_size:
+            if seq_len < world_size or seq_len % world_size != 0:
                 continue
             try:
                 K = cfg["hidden"] // world_size
@@ -289,6 +285,7 @@ def main():
                     return symm_mem._fused_matmul_reduce_scatter(
                         A_bf16, B_bf16, "sum", scatter_dim=0, group_name=group_name,
                     )
+                reset_nccl_tuning(fused_bf16)
                 s_bf16 = bench(fused_bf16, warmup=args.warmup, iters=args.iters)
 
                 # FP8 fused path
@@ -341,8 +338,10 @@ def main():
         cfg = MODELS[model_name]
         inter = cfg["intermediate"]
         hidden = cfg["hidden"]
+        if hidden % world_size != 0 or inter % world_size != 0:
+            continue
         for seq_len in args.seq_lengths:
-            if seq_len < world_size:
+            if seq_len < world_size or seq_len % world_size != 0:
                 continue
 
             # gate/up projection: AG(x=[S/TP, H]) -> [S, H] x W=[H, I/TP]
@@ -425,6 +424,9 @@ def main():
             output["gpu_mem_peak_bytes"] = torch.cuda.max_memory_allocated(device)
             output["results"] = json_results
             write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 

@@ -16,6 +16,7 @@ set -uo pipefail
 NPROC="${1:-8}"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 JSON_DIR="${BENCH_DIR}/results"
+TIMEOUT="${BENCH_TIMEOUT:-600}"
 
 shift || true
 while [[ $# -gt 0 ]]; do
@@ -51,6 +52,7 @@ echo "============================================================"
 echo "pytorch-dist-bench: running ${#BENCHMARKS[@]} benchmarks"
 echo "  GPUs: ${NPROC}"
 echo "  Results: ${JSON_DIR}"
+echo "  Timeout: ${TIMEOUT}s per benchmark (override: BENCH_TIMEOUT=N)"
 echo "============================================================"
 
 for bench_name in "${BENCHMARKS[@]}"; do
@@ -58,7 +60,7 @@ for bench_name in "${BENCHMARKS[@]}"; do
     echo ""
     echo "--- ${bench_name} ---"
 
-    if torchrun --nproc_per_node="$NPROC" \
+    if timeout "$TIMEOUT" torchrun --nproc_per_node="$NPROC" \
         "${BENCH_DIR}/${bench_name}.py" \
         --json "$json_path" \
         2>&1; then

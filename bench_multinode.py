@@ -48,8 +48,8 @@ from torch.distributed.tensor.parallel import (
 )
 
 from bench_utils import (
-    bench, collect_metadata, get_gpu_peak_bandwidth, reset_nccl_tuning,
-    write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, get_gpu_peak_bandwidth,
+    reset_nccl_tuning, write_json,
 )
 
 
@@ -442,7 +442,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

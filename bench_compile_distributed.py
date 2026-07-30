@@ -26,26 +26,27 @@ Usage:
 import argparse
 
 import torch
-import torch._dynamo
-import torch._inductor.config
+try:
+    import torch._dynamo
+    import torch._inductor.config
+except (ImportError, ModuleNotFoundError):
+    raise SystemExit(
+        "bench_compile_distributed requires torch._dynamo and torch._inductor "
+        "(not available in this PyTorch build)"
+    )
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
 
 
-def verify_compiled_output(eager_model, compiled_model, inp, dtype):
+def verify_compiled_output(eager_model, compiled_model, inp):
     """Check that compiled model produces the same output as eager."""
     with torch.no_grad():
         ref = eager_model(inp)
         out = compiled_model(inp)
-    atol = 1e-2 if dtype == torch.bfloat16 else 1e-4
-    if not torch.allclose(ref, out, atol=atol, rtol=0.05):
-        max_diff = (ref - out).abs().max().item()
-        raise RuntimeError(
-            f"Compiled output diverges from eager: max_diff={max_diff:.4f}"
-        )
+    verify_close("compiled_vs_eager", ref, out)
 
 
 # ---- Models ----
@@ -137,7 +138,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -246,7 +247,7 @@ def main():
             })
             continue
 
-        speedup = (eager_s["p50_us"] / compiled_s["p50_us"] - 1) * 100
+        speedup = (eager_s["p50_us"] / max(compiled_s["p50_us"], 0.1) - 1) * 100
 
         if rank == 0:
             print(
@@ -327,7 +328,7 @@ def main():
                 args.seq_len, args.hidden, dtype=dtype, device=device
             )
 
-            verify_compiled_output(tp_model_c, compiled_tp, tp_inp_c, dtype)
+            verify_compiled_output(tp_model_c, compiled_tp, tp_inp_c)
 
             def compiled_fwd():
                 with torch.no_grad():
@@ -354,7 +355,7 @@ def main():
             })
             continue
 
-        speedup = (eager_s["p50_us"] / compiled_s["p50_us"] - 1) * 100
+        speedup = (eager_s["p50_us"] / max(compiled_s["p50_us"], 0.1) - 1) * 100
 
         if rank == 0:
             print(
@@ -394,6 +395,9 @@ def main():
             )
             output["results"] = json_results
             write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 

@@ -38,8 +38,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
-    bench, collect_metadata, get_gpu_peak_bandwidth, reset_nccl_tuning,
-    write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, get_gpu_peak_bandwidth,
+    reset_nccl_tuning, write_json,
 )
 
 SIZES = [
@@ -124,9 +124,9 @@ def bench_p2p_sweep(rank, world_size, device, dtype, warmup, iters):
 # ---- Pipeline step ----
 
 
-def pipeline_step(stage_model, optimizer, inp_or_none, pp_rank, pp_stages,
-                  prev_rank, next_rank, num_microbatches, mb_size,
-                  hidden, device, dtype):
+def pipeline_step(stage_model, optimizer, inp_or_none, target_or_none,
+                  pp_rank, pp_stages, prev_rank, next_rank,
+                  num_microbatches, mb_size, hidden, device, dtype):
     saved = []
     optimizer.zero_grad()
 
@@ -147,7 +147,8 @@ def pipeline_step(stage_model, optimizer, inp_or_none, pp_rank, pp_stages,
     for mb in reversed(range(num_microbatches)):
         x, out = saved[mb]
         if next_rank is None:
-            loss = out.sum() / num_microbatches
+            tgt = target_or_none[mb * mb_size : (mb + 1) * mb_size]
+            loss = torch.nn.functional.mse_loss(out, tgt) / num_microbatches
             loss.backward()
         else:
             grad = torch.empty_like(out)
@@ -187,10 +188,14 @@ def bench_pipeline(rank, world_size, device, dtype,
     if pp_rank == 0:
         inp = torch.randn(batch_size, hidden, dtype=dtype, device=device)
 
+    target = None
+    if next_rank is None:
+        target = torch.randn(batch_size, hidden, dtype=dtype, device=device)
+
     def step():
-        pipeline_step(stage_model, optimizer, inp, pp_rank, pp_stages,
-                      prev_rank, next_rank, num_microbatches, mb_size,
-                      hidden, device, dtype)
+        pipeline_step(stage_model, optimizer, inp, target,
+                      pp_rank, pp_stages, prev_rank, next_rank,
+                      num_microbatches, mb_size, hidden, device, dtype)
 
     reset_nccl_tuning(step, warmup=warmup)
     s = bench(step, warmup=warmup, iters=iters)
@@ -259,10 +264,14 @@ def bench_fsdp2_pp(rank, world_size, device, dtype,
     if pp_rank == 0:
         inp = torch.randn(batch_size, hidden, dtype=dtype, device=device)
 
+    target = None
+    if next_rank is None:
+        target = torch.randn(batch_size, hidden, dtype=dtype, device=device)
+
     def step():
-        pipeline_step(stage_model, optimizer, inp, pp_rank, pp_stages,
-                      prev_rank, next_rank, num_microbatches, mb_size,
-                      hidden, device, dtype)
+        pipeline_step(stage_model, optimizer, inp, target,
+                      pp_rank, pp_stages, prev_rank, next_rank,
+                      num_microbatches, mb_size, hidden, device, dtype)
 
     reset_nccl_tuning(step, warmup=warmup)
     s = bench(step, warmup=warmup, iters=iters)
@@ -404,7 +413,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -488,6 +497,7 @@ def main():
                 for num_mbs in args.num_microbatches:
                     torch.cuda.empty_cache()
                     torch.cuda.reset_peak_memory_stats(device)
+                    ok = torch.tensor([1.0], device=device)
                     result = None
                     try:
                         result = bench_pipeline(
@@ -498,13 +508,16 @@ def main():
                     except torch.cuda.OutOfMemoryError:
                         if rank == 0:
                             print(f"{num_layers:>6} {batch_size:>5} {num_mbs:>4}  OOM")
+                        ok.zero_()
                         torch.cuda.empty_cache()
                     except Exception as e:
                         if rank == 0:
                             print(f"{num_layers:>6} {batch_size:>5} {num_mbs:>4}  FAILED: {e}")
+                        ok.zero_()
                         torch.cuda.empty_cache()
 
-                    if result is None:
+                    dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+                    if ok.item() < 1.0 or result is None:
                         continue
 
                     if rank == 0:
@@ -664,6 +677,9 @@ def main():
         output["gpu_mem_peak_bytes"] = torch.cuda.max_memory_allocated(device)
         output["results"] = json_results
         write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 

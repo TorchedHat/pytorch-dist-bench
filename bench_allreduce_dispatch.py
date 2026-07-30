@@ -19,7 +19,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from bench_utils import collect_metadata, stats, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, stats, write_json
 
 
 SIZES = [
@@ -177,7 +177,7 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     args = parser.parse_args()
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -215,6 +215,8 @@ def main():
         print(header)
         print("-" * len(header))
 
+    dist_graph_skipped = False
+
     for nelems in SIZES:
         tensor = torch.randn(nelems, dtype=torch.bfloat16, device=device)
 
@@ -227,39 +229,33 @@ def main():
                 pynccl_graph_result = bench_cuda_graph(
                     lambda: setup_pynccl_graph(pynccl_comm, tensor.clone()))
             except Exception:
-                pynccl_graph_result = {
-                    "graph_throughput_us": float("nan"),
-                    "graph_latency": {"p50_us": float("nan"), "p95_us": float("nan"),
-                                      "min_us": float("nan"), "max_us": float("nan"), "iters": 0},
-                }
+                pynccl_graph_result = None
 
         dist_result = bench_dist(group, tensor.clone(),
                                  warmup=args.warmup, iters=args.iters)
         try:
             dist_graph_result = bench_cuda_graph(
                 lambda: setup_dist_graph(group, tensor.clone()))
-        except Exception as e:
-            if rank == 0:
-                print(f"  CUDA graph capture FAILED for {nelems} elems: {e}")
-            dist_graph_result = {
-                "graph_throughput_us": float("nan"),
-                "graph_latency": {"p50_us": float("nan"), "p95_us": float("nan"),
-                                  "min_us": float("nan"), "max_us": float("nan"), "iters": 0},
-            }
+        except Exception:
+            dist_graph_result = None
+            dist_graph_skipped = True
 
         if rank == 0:
             nbytes = nelems * 2
             line = f"{nelems:>10} {nbytes:>10}"
 
             if pynccl_result is not None:
+                pg = pynccl_graph_result
+                pg_str = f"{pg['graph_latency']['p50_us']:>10.1f}us" if pg else f"{'skip':>12}"
                 line += (
                     f" | {pynccl_result['gpu_wall']['p50_us']:>10.1f}us"
-                    f" {pynccl_graph_result['graph_latency']['p50_us']:>10.1f}us"
+                    f" {pg_str}"
                 )
 
+            dg_str = f"{dist_graph_result['graph_latency']['p50_us']:>10.1f}us" if dist_graph_result else f"{'skip':>12}"
             line += (
                 f" | {dist_result['gpu_event']['p50_us']:>10.1f}us"
-                f" {dist_graph_result['graph_latency']['p50_us']:>10.1f}us"
+                f" {dg_str}"
             )
 
             if pynccl_result is not None:
@@ -269,19 +265,28 @@ def main():
 
             print(line)
 
+            dist_json = dict(dist_result)
+            if dist_graph_result is not None:
+                dist_json.update(dist_graph_result)
             result = {
                 "nelems": nelems,
                 "nbytes": nbytes,
-                "dist": {**dist_result, **dist_graph_result},
+                "dist": dist_json,
                 "pynccl": None,
             }
             if pynccl_result is not None:
-                result["pynccl"] = {**pynccl_result, **pynccl_graph_result}
+                pynccl_json = dict(pynccl_result)
+                if pynccl_graph_result is not None:
+                    pynccl_json.update(pynccl_graph_result)
+                result["pynccl"] = pynccl_json
             json_results.append(result)
 
     mem_after = torch.cuda.memory_allocated(device)
 
     if rank == 0:
+        if dist_graph_skipped:
+            print("\n  Note: CUDA graph capture not supported on this "
+                  "configuration — graph columns show 'skip'")
         print(f"\n  GPU memory delta: {(mem_after - mem_before) / 1024**2:.1f} MB")
 
         if args.json:
@@ -291,6 +296,9 @@ def main():
             output["pynccl_available"] = pynccl_comm is not None
             output["results"] = json_results
             write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     if pynccl_comm is not None:
         pynccl_comm.destroy()

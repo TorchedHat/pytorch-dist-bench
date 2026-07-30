@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -25,15 +26,28 @@ def load_json(path):
         return json.load(f)
 
 
+LABEL_KEYS = ("section", "topology", "collective", "op", "routing",
+              "model", "param_name")
+VALUE_KEYS = ("nelems", "seq_len", "num_tokens", "num_layers", "batch_size",
+              "num_microbatches", "dtype", "hidden")
+
+
+def entry_key(entry):
+    """Build a hashable key from identifying fields of a result entry."""
+    parts = []
+    for key in LABEL_KEYS + VALUE_KEYS:
+        if key in entry:
+            parts.append((key, entry[key]))
+    return tuple(parts)
+
+
 def extract_label(entry):
     """Build a human-readable label for a result entry."""
     parts = []
-    for key in ("section", "topology", "collective", "op", "routing",
-                "model", "param_name"):
+    for key in LABEL_KEYS:
         if key in entry:
             parts.append(str(entry[key]))
-    for key in ("nelems", "seq_len", "num_tokens", "num_layers", "batch_size",
-                "num_microbatches"):
+    for key in VALUE_KEYS:
         if key in entry:
             parts.append(f"{key}={entry[key]}")
     return "  ".join(parts) if parts else "unknown"
@@ -115,7 +129,14 @@ def compare_file(baseline_path, test_path, threshold):
     regressions = 0
     improvements = 0
 
-    for b_entry, t_entry in zip(b_results, t_results):
+    t_by_key = {}
+    for t_entry in t_results:
+        t_by_key[entry_key(t_entry)] = t_entry
+
+    for b_entry in b_results:
+        t_entry = t_by_key.get(entry_key(b_entry))
+        if t_entry is None:
+            continue
         label = extract_label(b_entry)
         b_metrics = dict(find_p50_metrics(b_entry))
         t_metrics = dict(find_p50_metrics(t_entry))
@@ -125,7 +146,7 @@ def compare_file(baseline_path, test_path, threshold):
                 continue
             b_val = b_metrics[metric_name]
             t_val = t_metrics[metric_name]
-            if b_val <= 0:
+            if b_val <= 0 or math.isnan(b_val) or math.isnan(t_val):
                 continue
 
             pct = (t_val - b_val) / b_val * 100

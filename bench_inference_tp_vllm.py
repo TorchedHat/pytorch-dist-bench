@@ -30,8 +30,8 @@ import torch
 import torch.distributed as dist
 
 from bench_utils import (
-    bench, collect_metadata, get_gpu_peak_bandwidth, reset_nccl_tuning,
-    write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, get_gpu_peak_bandwidth,
+    reset_nccl_tuning, write_json,
 )
 
 MODELS = {
@@ -142,8 +142,6 @@ def bench_tp_layer(model_name, cfg, tp, device, dtype,
     W_up = torch.randn(hidden, shard_inter, dtype=dtype, device=device) / math.sqrt(hidden)
     W_down = torch.randn(shard_inter, hidden, dtype=dtype, device=device) / math.sqrt(shard_inter)
 
-    out_buf = torch.empty(tokens, hidden, dtype=dtype, device=device)
-
     def tp_layer():
         qkv = torch.mm(x, W_qkv)
         o = torch.mm(qkv[:, :shard_h], W_o)
@@ -198,7 +196,7 @@ def main():
                  "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
     tp = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
@@ -333,6 +331,9 @@ def main():
         output["gpu_mem_peak_bytes"] = torch.cuda.max_memory_allocated(device)
         output["results"] = json_results
         write_json(args.json, output)
+
+    if rank == 0 and not json_results:
+        raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 
