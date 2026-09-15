@@ -127,8 +127,8 @@ def format_bytes(nbytes):
 def main():
     parser = argparse.ArgumentParser(
         description="Raw collective operations benchmark (torch.distributed)")
-    parser.add_argument("--dtype", default="bf16",
-                        choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--dtype", default="all",
+                        choices=["bf16", "fp16", "fp32", "all"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--json", metavar="PATH",
@@ -137,7 +137,8 @@ def main():
 
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
                  "fp32": torch.float32}
-    dtype = dtype_map[args.dtype]
+    dtypes_to_run = list(dtype_map.items()) if args.dtype == "all" else [
+        (args.dtype, dtype_map[args.dtype])]
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
@@ -145,95 +146,100 @@ def main():
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
-    torch.cuda.reset_peak_memory_stats(device)
-    mem_before = torch.cuda.memory_allocated(device)
-
     peaks = get_gpu_peak_bandwidth()
     nvlink_peak = peaks["nvlink_unidir_gbps"]
-
-    if rank == 0:
-        print(f"\n{'=' * 105}")
-        print(f"Raw Collective Operations Benchmark (torch.distributed)")
-        print(f"  World size: {world_size}  |  GPU: {torch.cuda.get_device_name(device)}  |  dtype: {args.dtype}")
-        print(f"  No fused ops, no symmetric memory — pure NCCL through ProcessGroup")
-        if nvlink_peak > 0:
-            print(f"  NVLink unidir peak: {nvlink_peak} GB/s")
-        print(f"{'=' * 105}")
 
     all_results = []
     alpha_beta = {}
 
-    for collective_name, bench_fn in [
-        ("all_reduce", bench_all_reduce),
-        ("all_gather", bench_all_gather),
-        ("reduce_scatter", bench_reduce_scatter),
-    ]:
-        if collective_name == "all_reduce":
-            results = bench_fn(device, dtype, SIZES, args.warmup, args.iters)
-        else:
-            results = bench_fn(device, dtype, SIZES, world_size,
-                               args.warmup, args.iters)
+    for dtype_name, dtype in dtypes_to_run:
+
+        torch.cuda.reset_peak_memory_stats(device)
+        mem_before = torch.cuda.memory_allocated(device)
 
         if rank == 0:
-            print(f"\n--- {collective_name} ---")
-            hdr = (f"{'nelems':>12} {'nbytes':>10}"
-                   f" | {'p50_us':>10} {'algo_GB/s':>10} {'bus_GB/s':>10}")
+            print(f"\n{'=' * 105}")
+            print(f"Raw Collective Operations Benchmark (torch.distributed)")
+            print(f"  World size: {world_size}  |  GPU: {torch.cuda.get_device_name(device)}  |  dtype: {dtype_name}")
+            print(f"  No fused ops, no symmetric memory — pure NCCL through ProcessGroup")
             if nvlink_peak > 0:
-                hdr += f" {'eff_%':>7}"
-            print(hdr)
-            print("-" * len(hdr))
+                print(f"  NVLink unidir peak: {nvlink_peak} GB/s")
+            print(f"{'=' * 105}")
 
-        sweep_points = []
-        for coll_name, nelems, s in results:
-            nbytes = nelems * dtype.itemsize
-            a_bw = algo_bw(nbytes, s["p50_us"])
-            b_bw = bus_bw(a_bw, world_size, coll_name)
-
-            eff_pct = round(b_bw / nvlink_peak * 100, 1) if nvlink_peak > 0 else None
+        for collective_name, bench_fn in [
+            ("all_reduce", bench_all_reduce),
+            ("all_gather", bench_all_gather),
+            ("reduce_scatter", bench_reduce_scatter),
+        ]:
+            if collective_name == "all_reduce":
+                results = bench_fn(device, dtype, SIZES, args.warmup, args.iters)
+            else:
+                results = bench_fn(device, dtype, SIZES, world_size,
+                                   args.warmup, args.iters)
 
             if rank == 0:
-                line = (
-                    f"{nelems:>12} {format_bytes(nbytes):>10}"
-                    f" | {s['p50_us']:>8.1f}us {a_bw:>9.1f} {b_bw:>9.1f}"
-                )
+                print(f"\n--- {collective_name} ---")
+                hdr = (f"{'nelems':>12} {'nbytes':>10}"
+                       f" | {'p50_us':>10} {'algo_GB/s':>10} {'bus_GB/s':>10}")
+                if nvlink_peak > 0:
+                    hdr += f" {'eff_%':>7}"
+                print(hdr)
+                print("-" * len(hdr))
+
+            sweep_points = []
+            for coll_name, nelems, s in results:
+                nbytes = nelems * dtype.itemsize
+                a_bw = algo_bw(nbytes, s["p50_us"])
+                b_bw = bus_bw(a_bw, world_size, coll_name)
+
+                eff_pct = round(b_bw / nvlink_peak * 100, 1) if nvlink_peak > 0 else None
+
+                if rank == 0:
+                    line = (
+                        f"{nelems:>12} {format_bytes(nbytes):>10}"
+                        f" | {s['p50_us']:>8.1f}us {a_bw:>9.1f} {b_bw:>9.1f}"
+                    )
+                    if eff_pct is not None:
+                        line += f" {eff_pct:>6.1f}%"
+                    print(line)
+
+                sweep_points.append((nbytes, s["p50_us"]))
+
+                entry = {
+                    "dtype": dtype_name,
+                    "collective": coll_name,
+                    "nelems": nelems,
+                    "nbytes": nbytes,
+                    "stats": s,
+                    "algo_bw_gbps": round(a_bw, 2),
+                    "bus_bw_gbps": round(b_bw, 2),
+                }
                 if eff_pct is not None:
-                    line += f" {eff_pct:>6.1f}%"
-                print(line)
+                    entry["efficiency_pct"] = eff_pct
+                all_results.append(entry)
 
-            sweep_points.append((nbytes, s["p50_us"]))
+            ab = fit_alpha_beta(sweep_points)
+            if ab is not None:
+                key = f"{dtype_name}/{collective_name}"
+                alpha_beta[key] = ab
+                if rank == 0:
+                    print(f"  alpha-beta fit: alpha={ab['alpha_us']:.1f} us"
+                          f"  beta={ab['beta_gbps']:.1f} GB/s"
+                          f"  (R²={ab['r_squared']:.4f})")
 
-            entry = {
-                "collective": coll_name,
-                "nelems": nelems,
-                "nbytes": nbytes,
-                "stats": s,
-                "algo_bw_gbps": round(a_bw, 2),
-                "bus_bw_gbps": round(b_bw, 2),
-            }
-            if eff_pct is not None:
-                entry["efficiency_pct"] = eff_pct
-            all_results.append(entry)
+        mem_after = torch.cuda.memory_allocated(device)
 
-        ab = fit_alpha_beta(sweep_points)
-        if ab is not None:
-            alpha_beta[collective_name] = ab
-            if rank == 0:
-                print(f"  alpha-beta fit: alpha={ab['alpha_us']:.1f} us"
-                      f"  beta={ab['beta_gbps']:.1f} GB/s"
-                      f"  (R²={ab['r_squared']:.4f})")
-
-    mem_after = torch.cuda.memory_allocated(device)
+        if rank == 0:
+            print(f"\n{'=' * 105}")
+            print(f"  algo_GB/s = nbytes / time  (raw throughput)")
+            print(f"  bus_GB/s  = algo_GB/s * correction  (link utilization)")
+            print(f"    AllReduce: 2*(N-1)/N  |  AllGather/ReduceScatter: (N-1)/N")
+            if nvlink_peak > 0:
+                print(f"  eff_%     = bus_GB/s / {nvlink_peak} GB/s  (NVLink unidir peak)")
+            print(f"  GPU memory delta: {(mem_after - mem_before) / 1024**2:.1f} MB")
+            print(f"{'=' * 105}\n")
 
     if rank == 0:
-        print(f"\n{'=' * 105}")
-        print(f"  algo_GB/s = nbytes / time  (raw throughput)")
-        print(f"  bus_GB/s  = algo_GB/s * correction  (link utilization)")
-        print(f"    AllReduce: 2*(N-1)/N  |  AllGather/ReduceScatter: (N-1)/N")
-        if nvlink_peak > 0:
-            print(f"  eff_%     = bus_GB/s / {nvlink_peak} GB/s  (NVLink unidir peak)")
-        print(f"  GPU memory delta: {(mem_after - mem_before) / 1024**2:.1f} MB")
-        print(f"{'=' * 105}\n")
-
         if args.json:
             output = collect_metadata("collectives", dp=world_size,
                                       dtype=args.dtype)
@@ -244,8 +250,8 @@ def main():
             output["results"] = all_results
             write_json(args.json, output)
 
-    if rank == 0 and not all_results:
-        raise SystemExit("ERROR: all configs failed — 0 results collected")
+        if not all_results:
+            raise SystemExit("ERROR: all configs failed — 0 results collected")
 
     dist.destroy_process_group()
 
