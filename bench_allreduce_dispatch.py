@@ -146,10 +146,11 @@ def setup_dist_graph(group, tensor):
         dist.all_reduce(tensor, group=group)
     stream.synchronize()
 
+    # torch.cuda.graph captures on its own side stream; CUDA rejects
+    # capture on the default stream that current_stream() returns here.
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
+    with torch.cuda.graph(graph):
         dist.all_reduce(tensor, group=group)
-    stream.synchronize()
     return graph, stream
 
 
@@ -161,9 +162,8 @@ def setup_pynccl_graph(comm, tensor):
     stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        comm.all_reduce(tensor, stream=stream)
-    stream.synchronize()
+    with torch.cuda.graph(graph):
+        comm.all_reduce(tensor, stream=torch.cuda.current_stream())
     return graph, stream
 
 
@@ -236,8 +236,10 @@ def main():
         try:
             dist_graph_result = bench_cuda_graph(
                 lambda: setup_dist_graph(group, tensor.clone()))
-        except Exception:
+        except Exception as e:
             dist_graph_result = None
+            if not dist_graph_skipped and rank == 0:
+                print(f"  dist graph capture failed: {type(e).__name__}: {e}")
             dist_graph_skipped = True
 
         if rank == 0:
