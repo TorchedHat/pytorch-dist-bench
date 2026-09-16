@@ -34,9 +34,8 @@ from bench_utils import (
     get_gpu_peak_bandwidth, reset_nccl_tuning, resolve_dtype, write_json,
 )
 
-# AllReduce cost is per byte; the GEMMs are what dtype changes, and fp32
-# inference is not served.
-DTYPES = ("bf16", "fp16")
+# AllReduce and GEMM cost per dtype at vLLM tensor shapes.
+DTYPES = ("bf16", "fp16", "fp32")
 
 MODELS = {
     "Llama-8B":   {"hidden": 4096,  "intermediate": 14336},

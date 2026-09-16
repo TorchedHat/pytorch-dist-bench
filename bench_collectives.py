@@ -25,26 +25,16 @@ import torch.distributed as dist
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
     fit_alpha_beta, get_gpu_peak_bandwidth, reset_nccl_tuning, resolve_dtype,
-    write_json,
+    sizes_in_elems, write_json,
 )
 
-# Collectives move bytes; dtype only rescales SIZES (defined in elements).
-DTYPES = ("bf16",)
+# AG moves bytes; AR/RS reduce in dtype. SIZES is in bytes so rows compare
+# across dtypes.
+DTYPES = ("bf16", "fp16", "fp32")
 
 
-SIZES = [
-    512,
-    2048,
-    8192,
-    32768,
-    131072,
-    524288,
-    2097152,
-    8388608,
-    33554432,
-    134217728,
-    536870912,
-]
+# Message sizes in bytes, 1 KB .. 1 GB.
+SIZES = [1 << n for n in range(10, 31, 2)]
 
 
 def algo_bw(nbytes, p50_us):
@@ -164,15 +154,16 @@ def main():
     all_results = []
     alpha_beta = {}
 
+    sizes = sizes_in_elems(SIZES, dtype)
     for collective_name, bench_fn in [
         ("all_reduce", bench_all_reduce),
         ("all_gather", bench_all_gather),
         ("reduce_scatter", bench_reduce_scatter),
     ]:
         if collective_name == "all_reduce":
-            results = bench_fn(device, dtype, SIZES, args.warmup, args.iters)
+            results = bench_fn(device, dtype, sizes, args.warmup, args.iters)
         else:
-            results = bench_fn(device, dtype, SIZES, world_size,
+            results = bench_fn(device, dtype, sizes, world_size,
                                args.warmup, args.iters)
 
         if rank == 0:

@@ -25,12 +25,12 @@ from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    reset_nccl_tuning, resolve_dtype, write_json,
+    fsdp_mp_policy, reset_nccl_tuning, resolve_dtype, write_json,
 )
 
-# Params live in the run dtype here: pure-fp16 Adam NaNs (see fsdp_mp_policy)
-# and fp32 is unrepresentative.
-DTYPES = ("bf16",)
+# FSDP2 step per dtype with fp32 master weights and dtype all-gather/reduce-
+# scatter.
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 class MLPBlock(nn.Module):
@@ -62,12 +62,12 @@ class FSDPBenchModel(nn.Module):
 
 def build_and_shard(hidden, intermediate, num_layers, device, dtype):
     """Build model, move to device, apply fully_shard() bottom-up."""
-    model = FSDPBenchModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype)
+    model = FSDPBenchModel(hidden, intermediate, num_layers).to(device=device)
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
 
     return model
 

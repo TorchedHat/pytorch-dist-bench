@@ -40,12 +40,13 @@ from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    reset_nccl_tuning, resolve_dtype, verify_close, write_json,
+    fsdp_mp_policy, reset_nccl_tuning, resolve_dtype, verify_close,
+    write_json,
 )
 
-# Inductor codegen differs per 16-bit dtype; fp32 distributed compile is not a
-# served configuration.
-DTYPES = ("bf16", "fp16")
+# Inductor codegen differs per dtype; FSDP2 params are fp32 master weights
+# under mp_policy.
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 def verify_compiled_output(eager_model, compiled_model, inp):
@@ -111,12 +112,11 @@ class TPModel(nn.Module):
 
 
 def build_fsdp_model(hidden, intermediate, num_layers, device, dtype):
-    model = FSDPModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype
-    )
+    model = FSDPModel(hidden, intermediate, num_layers).to(device=device)
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
     return model
 
 

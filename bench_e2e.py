@@ -43,9 +43,9 @@ from bench_utils import (
     resolve_dtype, stats, write_json,
 )
 
-# Training/inference throughput in the dtypes people run; fp32 is 2x slower and
-# unrepresentative.
-DTYPES = ("bf16", "fp16")
+# Throughput per dtype; FSDP2 sections keep fp32 master weights
+# (fsdp_mp_policy).
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 # ---- Models ----

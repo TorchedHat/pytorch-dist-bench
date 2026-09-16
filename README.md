@@ -27,10 +27,15 @@ dtype can still be forced on a single run with `--dtype`.
 
 | Sweep | Benchmarks | Why |
 |---|---|---|
-| fp32 bf16 fp16 | `verify` | every dtype path is a separate correctness claim |
-| bf16 fp16 | `compile_distributed`, `e2e`, `inference_tp_layer`, `inference_tp_vllm`, `symm_mem_fused_ops` | 16-bit is what these workloads run in; fused symm-mem GEMMs are 16-bit only |
-| bf16 fp32 | `training_fsdp_collectives` | fp32 gradient reduce-scatter is a real config; NVLS has no fp16 kernel |
-| bf16 | `collectives`, `moe_alltoall`, `pipeline_parallel`, `fsdp2_training` | pure data movement (dtype only rescales bytes), or params held in the run dtype |
+| bf16 fp16 fp32 | all dtype-aware benchmarks except `inference_tp_layer` | each dtype has its own kernels (NCCL reduction, cuBLAS GEMM, Inductor codegen); training benchmarks keep fp32 master weights and run the collectives in the sweep dtype |
+| bf16 fp16 | `inference_tp_layer` | fused symm-mem GEMMs are 16-bit inference paths; fp32 at 405B/S=32K is ~10x slower per iteration and overruns the per-benchmark timeout (`--dtype fp32` still works) |
+
+Byte-based size sweeps (`collectives`, `pipeline_parallel`, `multinode`) move
+the same messages in every dtype; element counts scale with `itemsize`.
+NVLS `multimem_all_reduce_` has no fp16 kernel, so that section is skipped
+under fp16. Training benchmarks hold fp32 master weights with
+`MixedPrecisionPolicy` (or `autocast` for the non-FSDP GPipe stage): pure
+fp16 parameters with Adam diverge on the first step.
 
 ## Requirements
 

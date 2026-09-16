@@ -36,8 +36,8 @@ from bench_utils import (
     reset_nccl_tuning, resolve_dtype, write_json,
 )
 
-# all_to_all_single moves bytes; other dtypes only rescale the message.
-DTYPES = ("bf16",)
+# all_to_all_single moves bytes; the sweep records each dtype's message sizes.
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 MODELS = {

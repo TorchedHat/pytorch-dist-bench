@@ -38,6 +38,12 @@ def add_dtype_arg(parser, sweep):
     parser.set_defaults(_dtype_sweep=sweep)
 
 
+def sizes_in_elems(sizes_bytes, dtype):
+    """Element counts for a byte-based size sweep, so every dtype moves the
+    same messages."""
+    return [n // dtype.itemsize for n in sizes_bytes]
+
+
 def resolve_dtype(args):
     """Handle --list-dtypes (before any CUDA/NCCL setup) and map --dtype."""
     if args.list_dtypes:

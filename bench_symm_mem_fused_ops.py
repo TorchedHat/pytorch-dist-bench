@@ -36,9 +36,8 @@ from bench_utils import (
     reset_nccl_tuning, resolve_dtype, verify_close, write_json,
 )
 
-# Fused GEMM ops are 16-bit inference paths; NVLS fp32 is covered by
-# bench_training_fsdp_collectives.
-DTYPES = ("bf16", "fp16")
+# Fused GEMMs per dtype; NVLS all-reduce runs for bf16/fp32 (no fp16 kernel).
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 MODELS = {

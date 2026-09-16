@@ -34,9 +34,8 @@ from bench_utils import (
     reset_nccl_tuning, resolve_dtype, write_json,
 )
 
-# Gradient reduce-scatter in fp32 (reduce_dtype=fp32) is a real config; NVLS
-# has no fp16 kernel.
-DTYPES = ("bf16", "fp32")
+# AG/RS per dtype; NVLS all-reduce runs for bf16/fp32 (no fp16 kernel).
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 # Llama-70B parameter shapes (the training-relevant model)

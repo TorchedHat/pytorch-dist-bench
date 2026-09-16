@@ -41,8 +41,8 @@ from bench_utils import (
     reset_nccl_tuning, resolve_dtype, verify_close, write_json,
 )
 
-# Fused symm-mem GEMM ops serve 16-bit inference only; fp32 at 405B/S=32K runs
-# ~500 ms/iter for no real workload.
+# Fused symm-mem GEMMs serve 16-bit inference; fp32 at 405B/S=32K is ~10x
+# slower per iter and overruns run_all's timeout. Force with --dtype fp32.
 DTYPES = ("bf16", "fp16")
 
 
