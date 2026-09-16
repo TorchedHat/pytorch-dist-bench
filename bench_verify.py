@@ -31,19 +31,6 @@ from bench_utils import (
 DTYPES = ("fp32", "bf16", "fp16")
 
 
-def tp_tolerance(ref, world_size):
-    """Absolute tolerance for a TP-sharded result vs an unsharded reference.
-
-    The sharded path rounds world_size partials and world_size-1 reduction
-    steps to dtype, each by at most eps/2 of the value rounded: a bound of
-    world_size * eps * max|intermediate|. Doubling it allows intermediates
-    up to 2x max|ref| (cancellation). Also used for the column-parallel
-    check, where it is loose (no reduction, expected diff 0).
-    """
-    eps = torch.finfo(ref.dtype).eps
-    return 2 * (world_size + 1) * eps * ref.abs().max().item()
-
-
 class MLPBlock(nn.Module):
     def __init__(self, hidden, intermediate):
         super().__init__()
@@ -236,9 +223,16 @@ def verify_tp_inference(rank, world_size, device, dtype):
         hidden = world_size * (256 // world_size or 1)
     tokens = 4
 
+    # Entries in {-1, 0, 1} with hidden <= 256 keep every product and
+    # partial sum an integer of magnitude <= 256, exact in bf16 (8
+    # significand bits), fp16 and fp32. Every sharded path must then be
+    # bit-identical to the reference: no tolerance, for any world size.
+    def exact(*shape):
+        return torch.randint(-1, 2, shape, device=device).to(dtype)
+
     torch.manual_seed(0)
-    W_full = torch.randn(hidden, hidden, dtype=dtype, device=device)
-    x = torch.randn(tokens, hidden, dtype=dtype, device=device)
+    W_full = exact(hidden, hidden)
+    x = exact(tokens, hidden)
 
     dist.broadcast(W_full, src=0)
     dist.broadcast(x, src=0)
@@ -257,16 +251,14 @@ def verify_tp_inference(rank, world_size, device, dtype):
     gathered_reorder = gathered.view(world_size, tokens, shard_size)
     gathered_result = gathered_reorder.permute(1, 0, 2).contiguous().view(tokens, hidden)
 
-    atol = tp_tolerance(ref, world_size)
-    ok = torch.allclose(gathered_result, ref, rtol=0, atol=atol)
+    ok = torch.equal(gathered_result, ref)
     r, msg = check("TP column-parallel matmul", ok,
-                    f"max diff: {(gathered_result - ref).abs().max().item():.6f}"
-                    f" (atol {atol:.6f})")
+                    f"max diff: {(gathered_result - ref).abs().max().item():g}")
     results.append(r)
     if rank == 0:
         print(msg)
 
-    W_row_full = torch.randn(hidden, hidden, dtype=dtype, device=device)
+    W_row_full = exact(hidden, hidden)
     dist.broadcast(W_row_full, src=0)
 
     ref_row = torch.mm(x, W_row_full)
@@ -276,11 +268,9 @@ def verify_tp_inference(rank, world_size, device, dtype):
     partial_row = torch.mm(x_shard, W_row_shard)
     dist.all_reduce(partial_row)
 
-    atol = tp_tolerance(ref_row, world_size)
-    ok = torch.allclose(partial_row, ref_row, rtol=0, atol=atol)
+    ok = torch.equal(partial_row, ref_row)
     r, msg = check("TP row-parallel matmul + AllReduce", ok,
-                    f"max diff: {(partial_row - ref_row).abs().max().item():.6f}"
-                    f" (atol {atol:.6f})")
+                    f"max diff: {(partial_row - ref_row).abs().max().item():g}")
     results.append(r)
     if rank == 0:
         print(msg)

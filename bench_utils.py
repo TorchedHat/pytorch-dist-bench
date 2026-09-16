@@ -258,15 +258,15 @@ def collect_metadata(benchmark_name, **kwargs):
     return meta
 
 
-# verify_close() tolerance in units of eps * max|output|. 16-bit: the paths
-# differ by where they round to dtype; measured <= 2 ULPs at TP=2..4. fp32:
-# they differ by GEMM accumulation order, ~0.2*sqrt(K) ULPs for Gaussian
-# inputs (7-36 ULPs measured at K=1k-16k; the unfused reference is itself
-# 7-15 ULPs from an fp64 ground truth). 256 is ~10x that noise and still
-# 5 orders of magnitude below a real bug. Statistical, not worst-case.
+# verify_close() tolerance in units of eps * max|output|, sized for the
+# suite's target of <= 8 ranks. 16-bit: the paths differ by where they
+# round to dtype and by the reduction chain (~sqrt(world_size) roundings);
+# observed <= 2 ULPs at TP=2..8, 8 is 4x that and still far below any
+# plumbing bug (a wrong shard is >= 30% of max at TP=8). fp32: GEMM
+# accumulation order dominates, ~0.2*sqrt(K) ULPs; 36 observed at K=16k.
 VERIFY_ULPS = {
-    torch.bfloat16: 4,
-    torch.float16: 4,
+    torch.bfloat16: 8,
+    torch.float16: 8,
     torch.float32: 256,
 }
 
