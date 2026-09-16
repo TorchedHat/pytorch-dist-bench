@@ -22,7 +22,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, fsdp_mp_policy, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, add_dtype_arg, collect_metadata, fsdp_mp_policy,
+    resolve_dtype, write_json,
+)
+
+# Correctness gate: every dtype path is a distinct claim.
+DTYPES = ("fp32", "bf16", "fp16")
 
 
 def tp_tolerance(ref, world_size):
@@ -285,15 +291,12 @@ def verify_tp_inference(rank, world_size, device, dtype):
 def main():
     parser = argparse.ArgumentParser(
         description="Correctness verification gate for distributed operations")
-    parser.add_argument("--dtype", default="fp32",
-                        choices=["bf16", "fp16", "fp32"])
+    add_dtype_arg(parser, DTYPES)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
-                 "fp32": torch.float32}
-    dtype = dtype_map[args.dtype]
+    dtype = resolve_dtype(args)
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()

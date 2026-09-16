@@ -17,6 +17,21 @@ torchrun --nproc_per_node=8 bench_collectives.py --json results/collectives.json
 python compare_results.py results/baseline/ results/test/ --threshold 5
 ```
 
+### Data types
+
+Each benchmark declares the dtypes for which it measures something distinct
+(`DTYPES` at the top of the script; `python bench_x.py --list-dtypes` prints
+them). `run_all.sh` runs one process per declared dtype and writes
+`<bench>_tp<N>_<dtype>.json`; `--dtypes "bf16"` restricts the sweep. Any
+dtype can still be forced on a single run with `--dtype`.
+
+| Sweep | Benchmarks | Why |
+|---|---|---|
+| fp32 bf16 fp16 | `verify` | every dtype path is a separate correctness claim |
+| bf16 fp16 | `compile_distributed`, `e2e`, `inference_tp_layer`, `inference_tp_vllm`, `symm_mem_fused_ops` | 16-bit is what these workloads run in; fused symm-mem GEMMs are 16-bit only |
+| bf16 fp32 | `training_fsdp_collectives` | fp32 gradient reduce-scatter is a real config; NVLS has no fp16 kernel |
+| bf16 | `collectives`, `moe_alltoall`, `pipeline_parallel`, `fsdp2_training` | pure data movement (dtype only rescales bytes), or params held in the run dtype |
+
 ## Requirements
 
 - PyTorch 2.6+ (for `fully_shard`, symmetric memory, FP8 fused ops)
@@ -167,14 +182,14 @@ The `p50_us` field (median latency in microseconds) is the primary metric used f
 
 ## Comparing results
 
-`compare_results.py` matches JSON files by filename between two result directories, extracts `p50_us` metrics, and flags regressions:
+`compare_results.py` matches JSON files by filename between two result directories, extracts `p50_us` metrics, and flags regressions. Files are named `<bench>_tp<N>_<dtype>.json` (or `<bench>_tp<N>.json` for benchmarks without a dtype option); baselines produced before the dtype suffix need a one-time rename.
 
 ```bash
 python compare_results.py results/baseline/ results/test/
 ```
 
 ```
-=== bench_collectives_tp8.json ===
+=== bench_collectives_tp8_bf16.json ===
   all_reduce  nelems=536870912      stats    1234.5 ->  1298.7  (+5.2%)  REGRESSION
   all_gather  nelems=536870912      stats    1100.2 ->  1045.1  (-5.0%)  IMPROVED
   ...

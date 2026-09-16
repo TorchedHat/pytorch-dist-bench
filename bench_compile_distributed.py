@@ -38,7 +38,14 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
+    reset_nccl_tuning, resolve_dtype, verify_close, write_json,
+)
+
+# Inductor codegen differs per 16-bit dtype; fp32 distributed compile is not a
+# served configuration.
+DTYPES = ("bf16", "fp16")
 
 
 def verify_compiled_output(eager_model, compiled_model, inp):
@@ -126,17 +133,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512,
                         help="Sequence length for TP section")
-    parser.add_argument("--dtype", default="bf16",
-                        choices=["bf16", "fp16", "fp32"])
+    add_dtype_arg(parser, DTYPES)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
-                 "fp32": torch.float32}
-    dtype = dtype_map[args.dtype]
+    dtype = resolve_dtype(args)
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()

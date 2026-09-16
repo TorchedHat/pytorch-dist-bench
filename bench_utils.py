@@ -10,6 +10,7 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -17,6 +18,32 @@ import torch
 import torch.distributed as dist
 
 BENCH_NCCL_TIMEOUT = timedelta(seconds=120)
+
+DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16,
+             "fp32": torch.float32}
+
+
+def add_dtype_arg(parser, sweep):
+    """Add --dtype and --list-dtypes.
+
+    `sweep` is the benchmark's DTYPES: the dtypes for which the benchmark
+    measures something distinct, in the order run_all.sh runs them; the
+    first is the default. Any dtype can still be forced with --dtype.
+    """
+    parser.add_argument("--dtype", default=sweep[0], choices=list(DTYPE_MAP),
+                        help=f"default {sweep[0]}; run_all.sh sweeps "
+                             f"{' '.join(sweep)}")
+    parser.add_argument("--list-dtypes", action="store_true",
+                        help="print the sweep dtypes and exit")
+    parser.set_defaults(_dtype_sweep=sweep)
+
+
+def resolve_dtype(args):
+    """Handle --list-dtypes (before any CUDA/NCCL setup) and map --dtype."""
+    if args.list_dtypes:
+        print(" ".join(args._dtype_sweep))
+        sys.exit(0)
+    return DTYPE_MAP[args.dtype]
 
 
 NVLINK_UNIDIR_GBPS = {
