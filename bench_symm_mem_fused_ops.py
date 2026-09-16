@@ -281,7 +281,11 @@ def main():
         print(hdr)
         print("-" * len(hdr))
 
-    ar_sizes = [1024, 4096, 16384, 65536, 262144, 1048576]
+    # multimem_all_reduce_ dispatches on bf16 and fp32 only.
+    nvls_ok = dtype in (torch.bfloat16, torch.float32)
+    if rank == 0 and not nvls_ok:
+        print(f"  skipped: multimem_all_reduce_ not implemented for {dtype}")
+    ar_sizes = [1024, 4096, 16384, 65536, 262144, 1048576] if nvls_ok else []
     for nelems in ar_sizes:
         try:
             s_dist, s_symm = bench_all_reduce(
