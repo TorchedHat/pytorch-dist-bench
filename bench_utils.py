@@ -225,22 +225,46 @@ def collect_metadata(benchmark_name, **kwargs):
     return meta
 
 
-def verify_close(name, a, b):
-    """Smoke-test that fused and unfused ops agree within BF16 noise.
+# verify_close() tolerance in units of eps * max|output|. 16-bit: the paths
+# differ by where they round to dtype; measured <= 2 ULPs at TP=2..4. fp32:
+# they differ by GEMM accumulation order, ~0.2*sqrt(K) ULPs for Gaussian
+# inputs (7-36 ULPs measured at K=1k-16k; the unfused reference is itself
+# 7-15 ULPs from an fp64 ground truth). 256 is ~10x that noise and still
+# 5 orders of magnitude below a real bug. Statistical, not worst-case.
+VERIFY_ULPS = {
+    torch.bfloat16: 4,
+    torch.float16: 4,
+    torch.float32: 256,
+}
 
-    Tolerance is derived from the output dtype's precision at the tensor's
-    scale — no caller-supplied atol/rtol to get wrong. Empirically validated
-    at TP=2..4 on H200 (max observed: 2 ULPs); 4× ULP gives 2× margin.
+
+def verify_close(name, a, b, group=None):
+    """Smoke-test that fused and unfused ops agree within dtype noise.
+
+    Tolerance comes from VERIFY_ULPS at the tensors' max magnitude. The
+    verdict is all-reduced over `group` (WORLD by default) so that ranks
+    reaching this call raise together; a rank that raised alone would skip
+    to the next config's collectives and deadlock the others.
     """
     a_f, b_f = a.float(), b.float()
     max_mag = torch.max(a_f.abs().max(), b_f.abs().max()).item()
     eps = torch.finfo(a.dtype).eps
-    atol = max(eps, 4 * eps * max_mag)
-    if not torch.allclose(a_f, b_f, atol=atol, rtol=0):
-        max_diff = (a_f - b_f).abs().max().item()
+    ulps = VERIFY_ULPS.get(a.dtype, 4)
+    atol = max(eps, ulps * eps * max_mag)
+    max_diff = (a_f - b_f).abs().max().item()
+    failed = not (max_diff <= atol)  # NaN-safe
+
+    any_failed = failed
+    if dist.is_initialized():
+        flag = torch.tensor([float(failed)], device=a.device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+        any_failed = flag.item() > 0
+
+    if any_failed:
         raise RuntimeError(
-            f"Correctness check failed for {name}: "
-            f"max_diff={max_diff:.4f}, atol={atol:.4f}")
+            f"Correctness check failed for {name}: max_diff={max_diff:.3e}, "
+            f"atol={atol:.3e} ({ulps} ULPs of {a.dtype} at |max|={max_mag:.3g}"
+            f"{'' if failed else '; this rank passed, another failed'})")
 
 
 def write_json(path, data):
