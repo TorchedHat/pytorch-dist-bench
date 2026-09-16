@@ -38,7 +38,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, stats, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, fsdp_mp_policy, stats, write_json
 
 
 # ---- Models ----
@@ -73,12 +73,12 @@ class TransformerMLPModel(nn.Module):
 def bench_fsdp2_training(rank, world_size, device, dtype,
                          hidden, intermediate, num_layers,
                          batch_size, warmup, iters):
-    model = TransformerMLPModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype)
+    model = TransformerMLPModel(hidden, intermediate, num_layers).to(device=device)
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     inp = torch.randn(batch_size, hidden, dtype=dtype, device=device)
@@ -274,11 +274,12 @@ def bench_fsdp2_pp_training(rank, world_size, device, dtype,
     next_rank = pp_col[pp_rank + 1] if pp_rank < pp_stages - 1 else None
 
     stage_model = TransformerMLPModel(hidden, intermediate, layers_per_stage).to(
-        device=device, dtype=dtype)
+        device=device)
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in stage_model.layers:
-        fully_shard(layer, mesh=dp_mesh)
-    fully_shard(stage_model, mesh=dp_mesh)
+        fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
+    fully_shard(stage_model, mesh=dp_mesh, mp_policy=mp_policy)
 
     optimizer = torch.optim.Adam(stage_model.parameters(), lr=1e-4)
     total_params = sum(p.numel() for p in stage_model.parameters())
