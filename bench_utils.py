@@ -258,46 +258,35 @@ def collect_metadata(benchmark_name, **kwargs):
     return meta
 
 
-# verify_close() tolerance in units of eps * max|output|, sized for the
-# suite's target of <= 8 ranks. 16-bit: the paths differ by where they
-# round to dtype and by the reduction chain (~sqrt(world_size) roundings);
-# observed <= 2 ULPs at TP=2..8, 8 is 4x that and still far below any
-# plumbing bug (a wrong shard is >= 30% of max at TP=8). fp32: GEMM
-# accumulation order dominates, ~0.2*sqrt(K) ULPs; 36 observed at K=16k.
-VERIFY_ULPS = {
-    torch.bfloat16: 8,
-    torch.float16: 8,
-    torch.float32: 256,
-}
+# Loose on purpose: catches a wrong shard or a missing reduce, not ULPs.
+# Absolute and scaled by max|out| because reduction outputs near zero carry
+# the rounding error of their partials. Sized for <= 8 ranks.
+VERIFY_ULPS = {torch.bfloat16: 8, torch.float16: 8, torch.float32: 256}
 
 
 def verify_close(name, a, b, group=None):
-    """Smoke-test that fused and unfused ops agree within dtype noise.
+    """Smoke-test that fused and unfused outputs agree; raise on all ranks.
 
-    Tolerance comes from VERIFY_ULPS at the tensors' max magnitude. The
-    verdict is all-reduced over `group` (WORLD by default) so that ranks
-    reaching this call raise together; a rank that raised alone would skip
-    to the next config's collectives and deadlock the others.
+    The verdict is all-reduced over `group` so ranks reaching this call
+    raise together; one rank raising alone would desync the collectives
+    that follow and hang the rest.
     """
-    a_f, b_f = a.float(), b.float()
-    max_mag = torch.max(a_f.abs().max(), b_f.abs().max()).item()
     eps = torch.finfo(a.dtype).eps
-    ulps = VERIFY_ULPS.get(a.dtype, 4)
-    atol = max(eps, ulps * eps * max_mag)
-    max_diff = (a_f - b_f).abs().max().item()
-    failed = not (max_diff <= atol)  # NaN-safe
+    max_mag = max(a.abs().max().item(), b.abs().max().item())
+    atol = max(eps, VERIFY_ULPS[a.dtype] * eps * max_mag)
+    try:
+        torch.testing.assert_close(b, a, rtol=0, atol=atol)
+        err = None
+    except AssertionError as e:
+        err = f"Correctness check failed for {name}: {e}"
 
-    any_failed = failed
     if dist.is_initialized():
-        flag = torch.tensor([float(failed)], device=a.device)
+        flag = torch.tensor([float(err is not None)], device=a.device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
-        any_failed = flag.item() > 0
-
-    if any_failed:
-        raise RuntimeError(
-            f"Correctness check failed for {name}: max_diff={max_diff:.3e}, "
-            f"atol={atol:.3e} ({ulps} ULPs of {a.dtype} at |max|={max_mag:.3g}"
-            f"{'' if failed else '; this rank passed, another failed'})")
+        if flag.item() > 0:
+            raise RuntimeError(err or f"{name}: failed on another rank")
+    elif err:
+        raise RuntimeError(err)
 
 
 def fsdp_mp_policy(dtype):
