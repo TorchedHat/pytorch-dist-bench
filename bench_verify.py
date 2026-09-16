@@ -22,7 +22,20 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, fsdp_mp_policy, write_json
+
+
+def tp_tolerance(ref, world_size):
+    """Absolute tolerance for a TP-sharded result vs an unsharded reference.
+
+    The sharded path rounds world_size partials and world_size-1 reduction
+    steps to dtype, each by at most eps/2 of the value rounded: a bound of
+    world_size * eps * max|intermediate|. Doubling it allows intermediates
+    up to 2x max|ref| (cancellation). Also used for the column-parallel
+    check, where it is loose (no reduction, expected diff 0).
+    """
+    eps = torch.finfo(ref.dtype).eps
+    return 2 * (world_size + 1) * eps * ref.abs().max().item()
 
 
 class MLPBlock(nn.Module):
@@ -152,14 +165,14 @@ def verify_fsdp2_training(rank, world_size, device, dtype):
 
     hidden, intermediate, num_layers = 256, 512, 2
 
-    model = SimpleModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype)
+    model = SimpleModel(hidden, intermediate, num_layers).to(device=device)
 
     init_params = {n: p.clone() for n, p in model.named_parameters()}
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     inp = torch.randn(4, hidden, dtype=dtype, device=device)
@@ -238,9 +251,11 @@ def verify_tp_inference(rank, world_size, device, dtype):
     gathered_reorder = gathered.view(world_size, tokens, shard_size)
     gathered_result = gathered_reorder.permute(1, 0, 2).contiguous().view(tokens, hidden)
 
-    ok = torch.allclose(gathered_result, ref, rtol=1e-2, atol=1e-2)
+    atol = tp_tolerance(ref, world_size)
+    ok = torch.allclose(gathered_result, ref, rtol=0, atol=atol)
     r, msg = check("TP column-parallel matmul", ok,
-                    f"max diff: {(gathered_result - ref).abs().max().item():.6f}")
+                    f"max diff: {(gathered_result - ref).abs().max().item():.6f}"
+                    f" (atol {atol:.6f})")
     results.append(r)
     if rank == 0:
         print(msg)
@@ -255,9 +270,11 @@ def verify_tp_inference(rank, world_size, device, dtype):
     partial_row = torch.mm(x_shard, W_row_shard)
     dist.all_reduce(partial_row)
 
-    ok = torch.allclose(partial_row, ref_row, rtol=1e-2, atol=1e-2)
+    atol = tp_tolerance(ref_row, world_size)
+    ok = torch.allclose(partial_row, ref_row, rtol=0, atol=atol)
     r, msg = check("TP row-parallel matmul + AllReduce", ok,
-                    f"max diff: {(partial_row - ref_row).abs().max().item():.6f}")
+                    f"max diff: {(partial_row - ref_row).abs().max().item():.6f}"
+                    f" (atol {atol:.6f})")
     results.append(r)
     if rank == 0:
         print(msg)

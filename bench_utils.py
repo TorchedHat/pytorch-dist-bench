@@ -267,6 +267,17 @@ def verify_close(name, a, b, group=None):
             f"{'' if failed else '; this rank passed, another failed'})")
 
 
+def fsdp_mp_policy(dtype):
+    """FSDP2 policy: fp32 master weights, all-gather and reduce-scatter in
+    `dtype`. Pure-dtype params are not a valid fp16 configuration: Adam's
+    eps and (1-beta2)*g^2 underflow to 0, so the first step divides by 0.
+    """
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    if dtype == torch.float32:
+        return MixedPrecisionPolicy()
+    return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+
+
 def write_json(path, data):
     """Write JSON results to path (call from rank 0 only)."""
     with open(path, "w") as f:
