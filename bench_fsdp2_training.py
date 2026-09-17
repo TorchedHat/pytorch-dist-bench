@@ -129,7 +129,9 @@ def main():
                                   device=device)
 
                 total_params = sum(p.numel() for p in model.parameters())
-                param_bytes = total_params * dtype.itemsize
+                # Sharded params are fp32 master weights regardless of dtype.
+                param_bytes = sum(p.numel() * p.element_size()
+                                  for p in model.parameters())
                 shard_bytes = param_bytes // world_size
 
                 def step():

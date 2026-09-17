@@ -113,9 +113,26 @@ def bench_cuda_graph(fn_setup, warmup=5, replay=200):
     """Benchmark collective inside CUDA graph capture + replay.
 
     Returns both throughput (batch replay) and latency (per-replay sync) modes.
-    fn_setup returns (graph, stream) after capture.
+    fn_setup returns (graph, stream, tensor) after capture; the tensor is
+    the graph's input buffer and must outlive every replay.
+
+    Capture is attempted per rank and the outcome agreed collectively:
+    replaying a captured collective on some ranks while others skipped
+    it would hang until the NCCL watchdog fires.
     """
-    graph, stream = fn_setup()
+    try:
+        graph, stream, tensor = fn_setup()
+        err = None
+    except Exception as e:
+        err = e
+    flag = torch.tensor([float(err is not None)], device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if flag.item() > 0:
+        raise RuntimeError(f"graph capture failed on a rank: {err or 'other rank'}")
+
+    for _ in range(warmup):
+        graph.replay()
+    torch.cuda.synchronize()
 
     # Throughput mode: replay N times, one sync at end
     t0 = time.perf_counter_ns()
@@ -151,7 +168,7 @@ def setup_dist_graph(group, tensor):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         dist.all_reduce(tensor, group=group)
-    return graph, stream
+    return graph, stream, tensor
 
 
 def setup_pynccl_graph(comm, tensor):
@@ -164,7 +181,7 @@ def setup_pynccl_graph(comm, tensor):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         comm.all_reduce(tensor, stream=torch.cuda.current_stream())
-    return graph, stream
+    return graph, stream, tensor
 
 
 
@@ -228,8 +245,11 @@ def main():
             try:
                 pynccl_graph_result = bench_cuda_graph(
                     lambda: setup_pynccl_graph(pynccl_comm, tensor.clone()))
-            except Exception:
+            except Exception as e:
                 pynccl_graph_result = None
+                if rank == 0:
+                    print(f"  pynccl graph capture failed: "
+                          f"{type(e).__name__}: {e}")
 
         dist_result = bench_dist(group, tensor.clone(),
                                  warmup=args.warmup, iters=args.iters)
