@@ -31,7 +31,10 @@ import argparse
 import torch
 import torch.distributed as dist
 
-from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, prepare_device,
+    reset_nccl_tuning, write_json,
+)
 
 # Dtypes run_all.sh sweeps (read from this line); the first is the default.
 # all_to_all_single moves bytes; the sweep records each dtype's message sizes.
@@ -213,6 +216,7 @@ def main():
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
 
     # Filter models: num_experts must be >= world_size for expert parallelism
     model_names = args.models or list(MODELS.keys())

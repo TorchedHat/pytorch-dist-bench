@@ -31,7 +31,10 @@ except (ImportError, ModuleNotFoundError):
         "(not available in this PyTorch build)"
     )
 
-from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, prepare_device,
+    reset_nccl_tuning, verify_close, write_json,
+)
 
 
 CONFIGS = [
@@ -70,6 +73,7 @@ def main():
     tp = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
     dtype = torch.bfloat16
 
     group_name = dist.group.WORLD.group_name

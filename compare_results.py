@@ -134,6 +134,12 @@ def compare_file(baseline_path, test_path, threshold):
             raise ValueError(
                 f"{key} differs: baseline={baseline.get(key)!r} "
                 f"test={test.get(key)!r}")
+    # Different measurement setup shifts tails and small sizes; note it.
+    for key in ("iters", "pinned_cpus", "world_size"):
+        if key in baseline or key in test:
+            if baseline.get(key) != test.get(key):
+                print(f"  note: {key} differs: baseline={baseline.get(key)!r} "
+                      f"test={test.get(key)!r}")
 
     b_results = baseline.get("results", [])
     t_results = test.get("results", [])

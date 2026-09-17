@@ -40,7 +40,7 @@ from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
-    reset_nccl_tuning, verify_close, write_json,
+    prepare_device, reset_nccl_tuning, verify_close, write_json,
 )
 
 # Dtypes run_all.sh sweeps (read from this line); the first is the default.
@@ -150,6 +150,7 @@ def main():
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
 
     json_results = []
 
