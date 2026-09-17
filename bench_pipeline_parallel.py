@@ -38,14 +38,15 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
-    BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    fsdp_mp_policy, get_gpu_peak_bandwidth, reset_nccl_tuning, resolve_dtype,
-    sizes_in_elems, write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
+    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
 )
 
-# P2P in bytes (SIZES); training sections use fp32 master weights with dtype
+# Dtypes run_all.sh sweeps (read from this line); the first is the default. P2P
+# in bytes (SIZES); training sections use fp32 master weights with dtype
 # compute.
 DTYPES = ("bf16", "fp16", "fp32")
+
 
 # Message sizes in bytes, 1 KB .. 1 GB.
 SIZES = [1 << n for n in range(10, 31, 2)]
@@ -410,14 +411,17 @@ def main():
                         help="MLP intermediate dim (default: 14336, Llama-8B)")
     parser.add_argument("--num-layers", type=int, nargs="+", default=[4, 8])
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 16])
-    add_dtype_arg(parser, DTYPES)
+    parser.add_argument("--dtype", default=DTYPES[0],
+                        choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype = resolve_dtype(args)
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                 "fp32": torch.float32}
+    dtype = dtype_map[args.dtype]
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()

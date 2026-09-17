@@ -48,11 +48,11 @@ from torch.distributed.tensor.parallel import (
 )
 
 from bench_utils import (
-    BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    fsdp_mp_policy, get_gpu_peak_bandwidth, reset_nccl_tuning, resolve_dtype,
-    sizes_in_elems, write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
+    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
 )
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
 # Opt-in multi-node; collectives in bytes (SIZES), 2D training with fp32 master
 # weights.
 DTYPES = ("bf16", "fp16", "fp32")
@@ -423,14 +423,17 @@ def main():
                         help="Layer counts to sweep (training section)")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4],
                         help="Batch sizes to sweep (training section)")
-    add_dtype_arg(parser, DTYPES)
+    parser.add_argument("--dtype", default=DTYPES[0],
+                        choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype = resolve_dtype(args)
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                 "fp32": torch.float32}
+    dtype = dtype_map[args.dtype]
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()

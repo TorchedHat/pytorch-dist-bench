@@ -29,11 +29,9 @@ except (ImportError, ModuleNotFoundError):
         "(not available in this PyTorch build)"
     )
 
-from bench_utils import (
-    BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    reset_nccl_tuning, resolve_dtype, write_json,
-)
+from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, write_json
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
 # AG/RS per dtype; NVLS all-reduce runs for bf16/fp32 (no fp16 kernel).
 DTYPES = ("bf16", "fp16", "fp32")
 
@@ -54,14 +52,17 @@ PARAMS = [
 def main():
     parser = argparse.ArgumentParser(
         description="FSDP2 training collectives benchmark")
-    add_dtype_arg(parser, DTYPES)
+    parser.add_argument("--dtype", default=DTYPES[0],
+                        choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype = resolve_dtype(args)
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                 "fp32": torch.float32}
+    dtype = dtype_map[args.dtype]
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()

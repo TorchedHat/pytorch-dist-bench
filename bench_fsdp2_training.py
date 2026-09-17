@@ -24,10 +24,11 @@ import torch.distributed as dist
 from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
-    BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    fsdp_mp_policy, reset_nccl_tuning, resolve_dtype, write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
+    reset_nccl_tuning, write_json,
 )
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
 # FSDP2 step per dtype with fp32 master weights and dtype all-gather/reduce-
 # scatter.
 DTYPES = ("bf16", "fp16", "fp32")
@@ -83,14 +84,17 @@ def main():
                         help="Number of MLP layers to stack")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16],
                         help="Batch sizes to sweep")
-    add_dtype_arg(parser, DTYPES)
+    parser.add_argument("--dtype", default=DTYPES[0],
+                        choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype = resolve_dtype(args)
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                 "fp32": torch.float32}
+    dtype = dtype_map[args.dtype]
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()

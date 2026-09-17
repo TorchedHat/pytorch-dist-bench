@@ -31,11 +31,9 @@ import argparse
 import torch
 import torch.distributed as dist
 
-from bench_utils import (
-    BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    reset_nccl_tuning, resolve_dtype, write_json,
-)
+from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, write_json
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
 # all_to_all_single moves bytes; the sweep records each dtype's message sizes.
 DTYPES = ("bf16", "fp16", "fp32")
 
@@ -198,14 +196,17 @@ def main():
     parser.add_argument("--models", nargs="+", default=None,
                         help="Models to benchmark (default: all compatible)")
     parser.add_argument("--tokens", nargs="+", type=int, default=TOKEN_COUNTS)
-    add_dtype_arg(parser, DTYPES)
+    parser.add_argument("--dtype", default=DTYPES[0],
+                        choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype = resolve_dtype(args)
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                 "fp32": torch.float32}
+    dtype = dtype_map[args.dtype]
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()

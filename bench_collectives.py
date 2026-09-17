@@ -23,13 +23,13 @@ import torch
 import torch.distributed as dist
 
 from bench_utils import (
-    BENCH_NCCL_TIMEOUT, add_dtype_arg, bench, collect_metadata,
-    fit_alpha_beta, get_gpu_peak_bandwidth, reset_nccl_tuning, resolve_dtype,
-    sizes_in_elems, write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fit_alpha_beta,
+    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
 )
 
-# AG moves bytes; AR/RS reduce in dtype. SIZES is in bytes so rows compare
-# across dtypes.
+# Dtypes run_all.sh sweeps (read from this line); the first is the default. AG
+# moves bytes; AR/RS reduce in dtype. SIZES is in bytes so rows compare across
+# dtypes.
 DTYPES = ("bf16", "fp16", "fp32")
 
 
@@ -121,14 +121,17 @@ def format_bytes(nbytes):
 def main():
     parser = argparse.ArgumentParser(
         description="Raw collective operations benchmark (torch.distributed)")
-    add_dtype_arg(parser, DTYPES)
+    parser.add_argument("--dtype", default=DTYPES[0],
+                        choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
 
-    dtype = resolve_dtype(args)
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                 "fp32": torch.float32}
+    dtype = dtype_map[args.dtype]
 
     dist.init_process_group(backend="nccl", timeout=BENCH_NCCL_TIMEOUT)
     rank = dist.get_rank()
