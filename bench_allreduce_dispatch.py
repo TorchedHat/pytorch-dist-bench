@@ -19,7 +19,9 @@ import time
 import torch
 import torch.distributed as dist
 
-from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, stats, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, collect_metadata, prepare_device, stats, write_json,
+)
 
 
 SIZES = [
@@ -199,6 +201,7 @@ def main():
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
 
     pynccl_comm = None
     try:

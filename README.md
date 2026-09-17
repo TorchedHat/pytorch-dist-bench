@@ -218,6 +218,40 @@ Summary: 42 metrics compared
 
 Exit code: 1 when any regression exceeds the threshold (default: 5%); 2 when the comparison is incomplete or inconsistent (a baseline file or entry missing from the test run, paired files disagreeing on `benchmark`/`dtype`, or no comparable metrics); 0 otherwise. A regression takes precedence over an incomplete run.
 
+## Noise study: setting thresholds from data
+
+A regression gate should flag changes well above run-to-run noise, and noise
+differs by metric. Five runs of every benchmark on a shared 3×H100 box, one
+build, sorted the suite into two regimes: anything over ~1 ms (training and
+inference steps, large collectives, large fused ops) moves 0.05–1% between
+runs — the FSDP2 step 0.03–0.06% — and gates at 2% on a single run;
+host-dominated operations under ~200 µs (1 KB latency, decode-size
+all-reduce, small fused ops, dispatch) move 2–5%, so a single-run gate there
+needs ~10% and only if a larger study confirms sigma ≤ 3% (five runs put
+a factor of ~3 on sigma). Tail ratios (p95/p50 at small sizes, 10–16%) and
+points where per-run values fall into two clusters (P2P near a protocol
+boundary) are outside any sigma-based gate; report them, do not gate them.
+Between-run offsets need environment control or interleaved A/B runs;
+iterations do not help them. `noise_study.py` measures all of this on one
+build:
+
+```bash
+python noise_study.py run --nproc 8 --runs 10          # ~15 min, results in noise/
+python noise_study.py analyze noise/
+```
+
+`run` records a build fingerprint (commit plus `libtorch_cuda.so` mtime, so
+a same-commit rebuild is caught) and GPU clocks around each run; `analyze`
+discards runs whose build changed, then reports per metric the run-to-run
+sigma, range, and drift (second half of runs vs first — the sign that A/B
+runs must be interleaved), and, for a target change `delta` per metric
+(`--delta alpha=5`), whether `delta >= 3 sigma` and how many runs per side
+an A/B needs (`(4 sigma / delta)^2`, 80% power at 5% significance). For
+`bench_collectives` the metrics are alpha (p50 at 1 KB), mid (p50 nearest
+16 MB), beta (algo GB/s at 1 GB) and p95/p50 at both ends; for other
+benchmarks every `p50_us`. Sigma from fewer than ~10 runs is itself rough,
+so treat N as guidance; 20 runs is the right size for setting thresholds.
+
 ## A/B testing a PyTorch PR
 
 `ab_test_pytorch_pr.sh` automates the full workflow: build baseline → run benchmarks → apply PR → rebuild → run benchmarks → compare.
@@ -234,7 +268,8 @@ Requires a PyTorch source checkout. Set `PYTORCH_DIR`, pass as the 3rd argument,
 
 All benchmarks share infrastructure through `bench_utils.py`:
 
-- **`bench(fn, warmup=50, iters=200)`** — CUDA-synchronous timing with `torch.cuda.synchronize()` before each clock read. Reports p50, p5, p95, IQR. Flags runs where IQR/median exceeds 10%.
+- **`bench(fn, warmup=50, iters=200)`** — CUDA-synchronous timing with `torch.cuda.synchronize()` before each clock read. Reports p50, p5, p95, IQR. Flags runs where IQR/median exceeds 10%. `bench_collectives` uses 1000 iterations so p95 rests on ~50 samples rather than 10; iterations narrow the estimate of each percentile but do not change run-to-run noise (measured the same at 100 and 1000).
+- **`prepare_device(device)`** — every benchmark calls it after `set_device`: pins the rank to the CPUs local to its GPU's PCI root (`/sys/bus/pci/devices/<bus>/local_cpulist`; `torchrun` places ranks anywhere, so the NUMA node a rank runs on is otherwise a per-run lottery) and records whether every rank pinned plus the SM clock. In interleaved pinned/unpinned runs on 3×H100, pinned was lower at every size by ~0.5 µs at 1 KB — consistent in direction, inside noise at 4+4 runs. `BENCH_PIN_CPU=0` disables; a cgroup-limited CPU set smaller than 8 disables it automatically. `compare_results` notes when `iters`, `pinned_cpus` or `world_size` differ between paired files.
 - **`reset_nccl_tuning(fn, warmup=20, group=None)`** — Barrier + warmup between configurations. NCCL's runtime tuner explores algorithms when tensor sizes change; without this reset, the first iterations at a new size use a suboptimal algorithm and inject multi-millisecond spikes. Pass `group` for sub-group benchmarks (e.g. intra-node or inter-node topologies).
 - **`collect_metadata(name, **kwargs)`** — Captures PyTorch version, commit SHA, CUDA/NCCL versions, GPU model, GPU driver, peak NVLink/HBM bandwidth, OS distro, kernel version, hostname, world size, node count, NCCL environment variables, and parallelism configuration.
 - **Sequential execution** — `run_all.sh` runs benchmarks one at a time to prevent GPU contention from corrupting measurements.
@@ -262,6 +297,7 @@ run_all.sh                      # Sequential runner for single-node benchmarks
 run_multinode.sh                # Multi-node launcher (torchrun with rendezvous)
 ab_test_pytorch_pr.sh           # A/B test harness for PyTorch PRs
 compare_results.py              # JSON regression detector
+noise_study.py                  # Run-to-run noise per metric; thresholds and run counts
 k8s/pytorchjob.yaml             # Kubernetes PyTorchJob manifest (3 nodes × 2 GPUs)
 ```
 

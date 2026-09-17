@@ -18,6 +18,73 @@ import torch.distributed as dist
 
 BENCH_NCCL_TIMEOUT = timedelta(seconds=120)
 
+def _parse_cpulist(text):
+    cpus = set()
+    for part in text.strip().split(","):
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+MIN_PIN_CPUS = 8
+
+
+def pin_to_gpu_numa(device):
+    """Pin this thread and its descendants to the CPUs local to `device`'s
+    PCI root (sysfs local_cpulist); torchrun otherwise leaves the NUMA node
+    to chance. Returns the CPU set, or None when disabled (BENCH_PIN_CPU=0),
+    unavailable, or fewer than MIN_PIN_CPUS are allowed (cgroup-limited).
+    """
+    if os.environ.get("BENCH_PIN_CPU", "1") == "0":
+        return None
+    try:
+        p = torch.cuda.get_device_properties(device)
+        bus = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
+        with open(f"/sys/bus/pci/devices/{bus}/local_cpulist") as f:
+            cpus = _parse_cpulist(f.read())
+        cpus &= os.sched_getaffinity(0)
+        if len(cpus) < MIN_PIN_CPUS:
+            return None
+        os.sched_setaffinity(0, cpus)
+        return cpus
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def gpu_sm_clock_mhz(device):
+    """Current SM clock of `device` from nvidia-smi, or None."""
+    try:
+        uuid = str(torch.cuda.get_device_properties(device).uuid)
+        out = subprocess.check_output(
+            ["nvidia-smi", "-i", f"GPU-{uuid}", "--query-gpu=clocks.sm",
+             "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, text=True, timeout=10)
+        return int(out.strip())
+    except Exception:
+        return None
+
+
+def prepare_device(device):
+    """Per-rank setup after set_device: pin to the GPU's NUMA node. Returns
+    JSON metadata: the smallest pinned set across ranks (0 if any rank is
+    unpinned), why pinning is off if it is, and this rank's SM clock.
+    """
+    pinned = pin_to_gpu_numa(device)
+    n = len(pinned) if pinned else 0
+    if dist.is_initialized():
+        t = torch.tensor([n], device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        n = int(t.item())
+    if os.environ.get("BENCH_PIN_CPU", "1") == "0":
+        why = "disabled"
+    elif n == 0:
+        why = "unavailable on some rank"
+    else:
+        why = "all ranks"
+    return {"pinned_cpus": n, "pinning": why,
+            "sm_clock_mhz_at_start": gpu_sm_clock_mhz(device)}
+
+
 def sizes_in_elems(sizes_bytes, dtype):
     """Element counts for a byte-based size sweep, so every dtype moves the
     same messages."""
