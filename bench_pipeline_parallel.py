@@ -39,7 +39,8 @@ from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
-    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
+    get_gpu_peak_bandwidth, prepare_device, reset_nccl_tuning, sizes_in_elems,
+    write_json,
 )
 
 # Dtypes run_all.sh sweeps (read from this line); the first is the default. P2P
@@ -428,6 +429,7 @@ def main():
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
     torch.cuda.reset_peak_memory_stats(device)
     mem_before = torch.cuda.memory_allocated(device)
 

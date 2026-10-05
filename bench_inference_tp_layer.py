@@ -36,7 +36,10 @@ except (ImportError, ModuleNotFoundError):
         "(not available in this PyTorch build)"
     )
 
-from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, prepare_device,
+    reset_nccl_tuning, verify_close, write_json,
+)
 
 # Dtypes run_all.sh sweeps (read from this line); the first is the default.
 # Fused symm-mem GEMMs serve 16-bit inference; fp32 at 405B/S=32K is ~10x
@@ -158,6 +161,7 @@ def main():
     tp = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
 
     group_name = dist.group.WORLD.group_name
 

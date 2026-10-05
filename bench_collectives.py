@@ -24,7 +24,8 @@ import torch.distributed as dist
 
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, bench, collect_metadata, fit_alpha_beta,
-    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
+    get_gpu_peak_bandwidth, prepare_device, reset_nccl_tuning, sizes_in_elems,
+    write_json,
 )
 
 # Dtypes run_all.sh sweeps (read from this line); the first is the default. AG
@@ -124,7 +125,7 @@ def main():
     parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--iters", type=int, default=200)
+    parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")
     args = parser.parse_args()
@@ -138,6 +139,7 @@ def main():
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    setup = prepare_device(device)
 
     torch.cuda.reset_peak_memory_stats(device)
     mem_before = torch.cuda.memory_allocated(device)
@@ -152,6 +154,8 @@ def main():
         print(f"  No fused ops, no symmetric memory — pure NCCL through ProcessGroup")
         if nvlink_peak > 0:
             print(f"  NVLink unidir peak: {nvlink_peak} GB/s")
+        print(f"  pinned CPUs: {setup['pinned_cpus'] or 'off'}  |  SM clock at start: "
+              f"{setup['sm_clock_mhz_at_start']} MHz  |  iters: {args.iters}")
         print(f"{'=' * 105}")
 
     all_results = []
@@ -172,7 +176,8 @@ def main():
         if rank == 0:
             print(f"\n--- {collective_name} ---")
             hdr = (f"{'nelems':>12} {'nbytes':>10}"
-                   f" | {'p50_us':>10} {'algo_GB/s':>10} {'bus_GB/s':>10}")
+                   f" | {'p50_us':>10}"
+                   f" {'algo_GB/s':>10} {'bus_GB/s':>10}")
             if nvlink_peak > 0:
                 hdr += f" {'eff_%':>7}"
             print(hdr)
@@ -231,7 +236,7 @@ def main():
 
         if args.json:
             output = collect_metadata("collectives", dp=world_size,
-                                      dtype=args.dtype)
+                                      dtype=args.dtype, iters=args.iters, **setup)
             output["gpu_mem_delta_bytes"] = mem_after - mem_before
             output["gpu_mem_peak_bytes"] = torch.cuda.max_memory_allocated(device)
             if alpha_beta:

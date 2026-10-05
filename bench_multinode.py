@@ -49,7 +49,8 @@ from torch.distributed.tensor.parallel import (
 
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
-    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
+    get_gpu_peak_bandwidth, prepare_device, reset_nccl_tuning, sizes_in_elems,
+    write_json,
 )
 
 # Dtypes run_all.sh sweeps (read from this line); the first is the default.
@@ -443,6 +444,7 @@ def main():
         "LOCAL_WORLD_SIZE", torch.cuda.device_count()))
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
 
     if world_size % local_world_size != 0:
         raise RuntimeError(

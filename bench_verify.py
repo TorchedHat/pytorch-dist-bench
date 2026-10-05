@@ -22,7 +22,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, fsdp_mp_policy, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, collect_metadata, fsdp_mp_policy, prepare_device,
+    write_json,
+)
 
 # Dtypes run_all.sh sweeps (read from this line); the first is the default.
 # Correctness gate: every dtype path is a distinct claim.
@@ -294,6 +297,7 @@ def main():
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+    prepare_device(device)
 
     if rank == 0:
         print(f"\n{'=' * 60}")
